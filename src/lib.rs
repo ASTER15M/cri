@@ -3,6 +3,7 @@
 // the same `f32` samples as CRI's own runtime, bit for bit.
 
 pub mod acb;
+pub mod acf;
 pub mod adx;
 pub mod afs2;
 mod error;

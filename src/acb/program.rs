@@ -18,6 +18,7 @@ pub enum CommandTable {
 	Track,
 	Synth,
 	TrackEvent,
+	Category, // an ACF's `CommandTable`
 }
 
 impl std::fmt::Display for CommandTable {
@@ -27,6 +28,7 @@ impl std::fmt::Display for CommandTable {
 			Self::Track => "TrackCommandTable",
 			Self::Synth => "SynthCommandTable",
 			Self::TrackEvent => "TrackEventTable",
+			Self::Category => "CommandTable",
 		})
 	}
 }
@@ -49,9 +51,10 @@ pub enum CueParam {
 	// Code 111: the send level to the ACF bus `StringValueTable[bus_name_index]`. Buses are found by
 	// name, so an empty one reaches none.
 	BusSendLevel { bus_name_index: u16, bus_name: String, level: f32 },
-	// Code 79: at most `instances` plays share limit `slot` at once. At the limit, a new play is
-	// refused when `kind` is 1; otherwise the oldest stops and gives the new one its place.
-	CueLimit { instances: u16, slot: u16, kind: u8 },
+	// Code 79, or 73 on a category: at most `instances` plays share limit `slot` at once. At the
+	// limit, a new play is refused when `kind` is 1; otherwise the oldest stops and gives the new one
+	// its place. Code 73 carries no kind.
+	CueLimit { instances: u16, slot: u16, kind: Option<u8> },
 	// Code 94: a combo sequence's settings. A play within `combo_time_ms` of the last advances to the
 	// next track, wrapping to `loop_back`; a later one starts again from track 0.
 	ComboSequential { combo_time_ms: u32, loop_back: u16 },
@@ -769,7 +772,11 @@ impl Cursor {
 
 // One parameter command. `strings` is the `StringValueTable` that bus, selector and label commands
 // index.
-fn decode_param(c: &Command, table: CommandTable, strings: &[String]) -> Result<CueParam> {
+pub(crate) fn decode_param(
+	c: &Command,
+	table: CommandTable,
+	strings: &[String],
+) -> Result<CueParam> {
 	let pair = || -> Result<[u16; 2]> {
 		let b = <&[u8; 4]>::try_from(&c.payload[..]).map_err(|_| unsupported(c, table))?;
 		Ok([u16::from_be_bytes([b[0], b[1]]), u16::from_be_bytes([b[2], b[3]])])
@@ -812,7 +819,12 @@ fn decode_param(c: &Command, table: CommandTable, strings: &[String]) -> Result<
 		79 if p.len() == 5 => CueParam::CueLimit {
 			instances: u16::from_be_bytes([p[0], p[1]]),
 			slot: u16::from_be_bytes([p[2], p[3]]),
-			kind: p[4],
+			kind: Some(p[4]),
+		},
+		73 if p.len() == 4 => CueParam::CueLimit {
+			instances: u16::from_be_bytes([p[0], p[1]]),
+			slot: u16::from_be_bytes([p[2], p[3]]),
+			kind: None,
 		},
 		// The trailing 8 bytes are the time of the last play, which the runtime writes back.
 		94 if p.len() == 14 => CueParam::ComboSequential {
@@ -849,7 +861,7 @@ fn decode_param(c: &Command, table: CommandTable, strings: &[String]) -> Result<
 			let [selector, label] = pair()?;
 			CueParam::SelectorLabel { selector: string(selector, false)?, label: string(label, false)? }
 		}
-		79 | 94 | 120 | 31 | 36 | 38 | 40 => return Err(unsupported(c, table)),
+		73 | 79 | 94 | 120 | 31 | 36 | 38 | 40 => return Err(unsupported(c, table)),
 		code => CueParam::Other { table, code, payload: c.payload.clone() },
 	})
 }
@@ -973,7 +985,7 @@ mod tests {
 	fn playback_rules() {
 		assert_eq!(
 			one("004f05 0003000201 0000", CommandTable::Sequence),
-			CueParam::CueLimit { instances: 3, slot: 2, kind: 1 }
+			CueParam::CueLimit { instances: 3, slot: 2, kind: Some(1) }
 		);
 		assert_eq!(
 			one("005e0e 00000050 0002 0000000000001234 0000", CommandTable::Sequence),

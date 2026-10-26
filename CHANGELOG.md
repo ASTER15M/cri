@@ -11,6 +11,7 @@ is a breaking change and a patch bump (0.1.0 → 0.1.1) is not.
   `CueParam::Other` instead of failing the program, so a player has to refuse what it does not
   model; `CueProgram::all_params` lists every scope's parameters for that check.
 - **Breaking:** `CueParam` and the new enums are `#[non_exhaustive]`.
+- **Breaking:** `CommandTable` has a `Category` variant, an ACF's `CommandTable`.
 - Random, random-no-repeat and combo-sequential sequences resolve, with their tracks' weights
   (`ProgramTrack::weight`) and `CueProgram::sequence_type`; a player picks the track.
 - Note-ons into another sequence resolve as `ProgramTrack::nested`, which includes a song preview's
@@ -19,6 +20,11 @@ is a breaking change and a patch bump (0.1.0 → 0.1.1) is not.
 - Local AISACs at sequence and synth scope, and global AISAC references at sequence and track scope,
   are listed instead of ignored or refused.
 - A bus send to an empty bus name resolves; it reaches no bus.
+- `acf` reads ACF project settings in both the named-effect layout and the older numbered one:
+  categories with their commands and global AISACs, each DSP bus setting's buses with their
+  volumes, effects (`Effect::matrix` decodes a `Matrix`) and sends, global AISACs with their graphs,
+  the bus list AISAC graph types count through, REACT rules, selectors and voice limit groups.
+- `CueParam::CueLimit::kind` is optional: a category's code 73 carries none.
 
 ## 0.1.0
 

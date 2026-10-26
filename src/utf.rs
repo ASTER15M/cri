@@ -205,6 +205,12 @@ impl Utf {
 	pub(crate) fn get_i64(&self, row: usize, name: &str) -> Option<i64> {
 		self.get(row, name)?.as_i64()
 	}
+	pub(crate) fn get_f32(&self, row: usize, name: &str) -> Option<f32> {
+		match self.get(row, name)? {
+			Value::F32(v) => Some(*v),
+			_ => None,
+		}
+	}
 	pub(crate) fn get_str(&self, row: usize, name: &str) -> Option<&str> {
 		self.get(row, name)?.as_str()
 	}

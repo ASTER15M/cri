@@ -13,6 +13,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub enum Format {
 	Utf,
 	Acb,
+	Acf,
 	Afs2,
 	Adx,
 	Hca,
@@ -26,6 +27,7 @@ impl fmt::Display for Format {
 		f.write_str(match self {
 			Self::Utf => "@UTF",
 			Self::Acb => "ACB",
+			Self::Acf => "ACF",
 			Self::Afs2 => "AFS2",
 			Self::Adx => "ADX",
 			Self::Hca => "HCA",
