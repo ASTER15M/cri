@@ -1,6 +1,6 @@
 // The read-only commands: what files are, their tables, cues, waveforms, buses and streams
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -570,29 +570,135 @@ fn print_tree(root: &Utf) -> Result<()> {
 	Ok(())
 }
 
-pub fn cues(path: &Path, awb: Option<PathBuf>, filter: Option<&str>) -> Result<()> {
-	let acb = Acb::open(path)?;
-	let sheet = open_sheet(&acb, load_awb(path, awb)?)?;
-	let filter = filter.map(str::to_lowercase);
+pub struct Info {
+	pub patterns: Vec<String>,
+	pub cues: bool,
+	pub waves: bool,
+	pub full: bool,
+	pub graphs: bool,
+	pub awb: Option<PathBuf>,
+}
+
+// Every section of a file, or those the flags name. Flags that do not apply to the file refuse it.
+pub fn info(path: &Path, o: Info) -> Result<()> {
+	let bytes = read(path)?;
+	let what = match sniff(&bytes) {
+		Kind::Utf => {
+			let root = Utf::parse(&bytes)?;
+			let has = |c: &str| root.columns.iter().any(|col| col.name == c);
+			if has("CueTable") {
+				return acb_info(path, bytes, o);
+			}
+			if has("DspSettingTable") || has("CategoryTable") {
+				refuse(&o, "an ACF", false, true)?;
+				return acf(&Acf::from_bytes(&bytes)?, o.graphs);
+			}
+			"a bare @UTF table, which `cri utf` reads"
+		}
+		Kind::Afs2 => {
+			refuse(&o, "an AWB", true, false)?;
+			return awb(&bytes);
+		}
+		Kind::Usm => {
+			refuse(&o, "a USM", false, false)?;
+			let len = bytes.len();
+			return usm(&Usm::parse(bytes)?, len);
+		}
+		Kind::Hca => "an HCA bitstream",
+		Kind::Adx => "an ADX bitstream",
+		Kind::Unknown => "not a CRI file",
+	};
+	refuse(&o, what, false, false)?;
+	println!("{}", summarize(path, bytes)?.join("\n  "));
+	Ok(())
+}
+
+fn refuse(o: &Info, what: &str, waves: bool, graphs: bool) -> Result<()> {
+	let flags = [
+		(!o.patterns.is_empty(), "a cue pattern"),
+		(o.cues, "--cues"),
+		(o.full, "--full"),
+		(o.waves && !waves, "--waves"),
+		(o.graphs && !graphs, "--graphs"),
+	];
+	match flags.iter().find(|(given, _)| *given) {
+		Some((_, flag)) => bail!("{flag} does not apply to {what}"),
+		None => Ok(()),
+	}
+}
+
+fn acb_info(path: &Path, bytes: Vec<u8>, o: Info) -> Result<()> {
+	let full = o.full || o.graphs;
+	let all = !(o.cues || full || o.waves);
+	let acb = Acb::from_bytes(bytes)?;
+
+	// A number matches the cue with that ID; anything else, the cues whose names contain it.
+	let patterns: Vec<(Option<i64>, String)> =
+		o.patterns.iter().map(|p| (p.parse().ok(), p.to_lowercase())).collect();
+	let cues: Vec<_> = acb
+		.cues()
+		.into_iter()
+		.enumerate()
+		.filter(|(_, c)| {
+			let name = c.name.to_lowercase();
+			patterns.is_empty()
+				|| patterns.iter().any(|(id, p)| match id {
+					Some(id) => c.id == *id,
+					None => name.contains(p.as_str()),
+				})
+		})
+		.collect();
+	if cues.is_empty() && !patterns.is_empty() {
+		bail!("no cue matches {}", o.patterns.join(", "));
+	}
+	if all {
+		println!("{}\n", summarize(path, acb.buffer().to_vec())?.join("\n  "));
+	}
+
+	// The waveform lines borrow the streaming AWB, which the cue sheet then takes.
+	let streaming = load_awb(path, o.awb)?;
+	let waves = (all || o.waves)
+		.then(|| {
+			let only: Option<BTreeSet<usize>> = (!patterns.is_empty())
+				.then(|| cues.iter().flat_map(|(_, c)| c.waveforms.iter().copied()).collect());
+			wave_lines(&acb, streaming.as_deref(), only.as_ref())
+		})
+		.transpose()?;
+	let sheet = open_sheet(&acb, streaming)?;
+	let indices: Vec<usize> = cues.iter().map(|(i, _)| *i).collect();
+	let show_cues = all || o.cues || full;
+	if show_cues {
+		println!("cues");
+		if full {
+			cue_programs(&sheet, &indices, o.graphs);
+		} else {
+			cue_lines(&sheet, &indices);
+		}
+	}
+	if let Some(waves) = waves {
+		if show_cues {
+			println!();
+		}
+		println!("waveforms");
+		waves.iter().for_each(|l| println!("  {l}"));
+	}
+	Ok(())
+}
+
+fn cue_lines(sheet: &CueSheet, indices: &[usize]) {
 	println!(
-		"{:>5} {:>6}  {:<32} {:>13}  {:<12} {:>6}  categories",
+		"  {:>5} {:>6}  {:<32} {:>13}  {:<12} {:>6}  categories",
 		"index", "id", "name", "length", "sequence", "layers"
 	);
 	let mut refused = 0;
-	for i in 0..sheet.cue_count() {
-		let name = sheet.cue_name(i).unwrap_or("");
-		if let Some(f) = &filter
-			&& !name.to_lowercase().contains(f)
-		{
-			continue;
-		}
+	for &i in indices {
 		match sheet.program(i) {
 			Ok(p) => {
 				let layers: usize = p.tracks.iter().map(|t| t.layers.len()).sum();
 				let nested = p.tracks.iter().any(|t| !t.nested.is_empty());
 				let actions = if p.action_tracks.is_empty() { "" } else { " +actions" };
 				println!(
-					"{i:>5} {:>6}  {:<32} {:>13}  {:<12} {:>5}{}  {:?}{actions}",
+					"  {i:>5} {:>6}  {:<32} {:>13}  {:<12} {:>5}{}  {:?}{actions}",
 					p.cue_id,
 					p.name,
 					seconds(p.length_ms),
@@ -604,14 +710,14 @@ pub fn cues(path: &Path, awb: Option<PathBuf>, filter: Option<&str>) -> Result<(
 			}
 			Err(e) => {
 				refused += 1;
-				println!("{i:>5} {:>6}  {name:<32} unresolved: {}", "?", e.root());
+				let name = sheet.cue_name(i).unwrap_or("");
+				println!("  {i:>5} {:>6}  {name:<32} unresolved: {}", "?", e.root());
 			}
 		}
 	}
 	if refused > 0 {
-		println!("{refused} cue(s) did not resolve");
+		println!("  {refused} cue(s) did not resolve");
 	}
-	Ok(())
 }
 
 fn sequence_name(t: SequenceType) -> String {
@@ -624,41 +730,41 @@ fn sequence_name(t: SequenceType) -> String {
 	}
 }
 
-pub fn cue(path: &Path, awb: Option<PathBuf>, wanted: &[String], graphs: bool) -> Result<()> {
-	let acb = Acb::open(path)?;
-	let sheet = open_sheet(&acb, load_awb(path, awb)?)?;
-	for (n, w) in wanted.iter().enumerate() {
-		let index = match w.parse::<i64>() {
-			Ok(id) => sheet.cue_index_by_id(id).with_context(|| format!("no cue has id {id}"))?,
-			Err(_) => sheet.cue_index_by_name(w).with_context(|| format!("no cue is named {w}"))?,
-		};
+fn cue_programs(sheet: &CueSheet, indices: &[usize], graphs: bool) {
+	for (n, &index) in indices.iter().enumerate() {
 		if n > 0 {
 			println!();
 		}
-		let p = sheet.program(index)?;
-		println!("cue {:?}: id {}, index {}", p.name, p.cue_id, p.cue_index);
-		println!("  length {}, layers span {:.1} ms", seconds(p.length_ms), p.span_ms());
+		let p = match sheet.program(index) {
+			Ok(p) => p,
+			Err(e) => {
+				let name = sheet.cue_name(index).unwrap_or("");
+				println!("  cue {name:?}, index {index}: unresolved: {}", e.root());
+				continue;
+			}
+		};
+		println!("  cue {:?}: id {}, index {}", p.name, p.cue_id, p.cue_index);
+		println!("    length {}, layers span {:.1} ms", seconds(p.length_ms), p.span_ms());
 		if let Some(s) = p.sequence_index {
-			println!("  sequence[{s}], {}", sequence_name(p.sequence_type));
+			println!("    sequence[{s}], {}", sequence_name(p.sequence_type));
 		}
-		let scope = Scope { sheet: &sheet, graphs };
-		scope.params("  ", &p.params, &p.local_aisacs, &p.global_aisacs);
-		scope.tracks("  ", &p.tracks);
+		let scope = Scope { sheet, graphs };
+		scope.params("    ", &p.params, &p.local_aisacs, &p.global_aisacs);
+		scope.tracks("    ", &p.tracks);
 		for a in &p.action_tracks {
 			let target = match &a.target {
 				ActionTarget::Cue { acb_name, cue_id } => format!("cue id {cue_id} of {acb_name:?}"),
 				other => format!("{other:?}"),
 			};
-			println!("  action track[{}] on {target}", a.index);
+			println!("    action track[{}] on {target}", a.index);
 			for e in &a.events {
 				match e {
-					ActionEvent::Start { at_ms } => println!("    +{at_ms:>6} ms  start"),
-					ActionEvent::Stop { at_ms } => println!("    +{at_ms:>6} ms  stop"),
+					ActionEvent::Start { at_ms } => println!("      +{at_ms:>6} ms  start"),
+					ActionEvent::Stop { at_ms } => println!("      +{at_ms:>6} ms  stop"),
 				}
 			}
 		}
 	}
-	Ok(())
 }
 
 struct Scope<'s, 'a> {
@@ -788,17 +894,22 @@ fn param(p: &CueParam) -> String {
 	}
 }
 
-pub fn waves(path: &Path, awb: Option<PathBuf>) -> Result<()> {
-	let acb = Acb::open(path)?;
+// An ACB's waveforms, or those in `only`, beside their bitstreams' own headers
+fn wave_lines(
+	acb: &Acb,
+	streaming: Option<&[u8]>,
+	only: Option<&BTreeSet<usize>>,
+) -> Result<Vec<String>> {
 	let embedded = acb.internal_awb().transpose()?;
-	let streaming = load_awb(path, awb)?;
-	let streaming =
-		streaming.as_ref().map(|b| Afs2::parse(b).map(|a| (a, b.as_slice()))).transpose()?;
-	println!(
+	let streaming = streaming.map(|b| Afs2::parse(b).map(|a| (a, b))).transpose()?;
+	let mut out = vec![format!(
 		"{:>5}  {:<6} {:>2} {:>6} {:>9}  {:<9} {:>5}  bitstream",
 		"index", "codec", "ch", "rate", "length", "stored", "awb"
-	);
+	)];
 	for w in acb.waveforms() {
+		if only.is_some_and(|o| !o.contains(&w.index)) {
+			continue;
+		}
 		let archive = if w.streaming { streaming.as_ref() } else { embedded.as_ref() };
 		let bitstream = match archive {
 			Some((a, b)) => match a.entries.iter().find(|e| i64::from(e.id) == w.awb_id) {
@@ -807,7 +918,7 @@ pub fn waves(path: &Path, awb: Option<PathBuf>) -> Result<()> {
 			},
 			None => "archive not loaded".into(),
 		};
-		println!(
+		out.push(format!(
 			"{:>5}  {:<6} {:>2} {:>6} {:>8.2}s  {:<9} {:>5}  {bitstream}",
 			w.index,
 			w.codec_name(),
@@ -816,19 +927,25 @@ pub fn waves(path: &Path, awb: Option<PathBuf>) -> Result<()> {
 			w.duration_secs(),
 			if w.streaming { "streaming" } else { "embedded" },
 			w.awb_id
-		);
+		));
 	}
-	Ok(())
+	Ok(out)
 }
 
-pub fn awb(path: &Path) -> Result<()> {
-	let bytes = read(path)?;
-	let a = Afs2::parse(&bytes)?;
-	println!("{} entries, alignment {}, subkey {}", a.entries.len(), a.align, a.subkey);
-	println!("{:>6} {:>10} {:>9}  bitstream", "id", "offset", "bytes");
+fn awb(bytes: &[u8]) -> Result<()> {
+	let a = Afs2::parse(bytes)?;
+	println!(
+		"AWB: {} entries, alignment {}, subkey {}, {} bytes",
+		a.entries.len(),
+		a.align,
+		a.subkey,
+		bytes.len()
+	);
+	println!("\nwaveforms");
+	println!("  {:>6} {:>10} {:>9}  bitstream", "id", "offset", "bytes");
 	for e in &a.entries {
 		println!(
-			"{:>6} {:>#10x} {:>9}  {}",
+			"  {:>6} {:>#10x} {:>9}  {}",
 			e.id,
 			e.offset,
 			e.len,
@@ -838,8 +955,7 @@ pub fn awb(path: &Path) -> Result<()> {
 	Ok(())
 }
 
-pub fn acf(path: &Path, graphs: bool) -> Result<()> {
-	let acf = Acf::open(path)?;
+fn acf(acf: &Acf, graphs: bool) -> Result<()> {
 	println!("ACF {:?}, version {:#010x} ({})", acf.name, acf.version, acf.version_string);
 
 	println!("\ncategories");
@@ -902,7 +1018,7 @@ pub fn acf(path: &Path, graphs: bool) -> Result<()> {
 			let default = a.default_control.map_or(String::new(), |d| format!(", default {d}"));
 			println!("  [{}] {:<28} control {}{default}", a.index, a.name, a.control_id);
 			for g in &a.graphs {
-				let target = graph_target(&acf, g.kind);
+				let target = graph_target(acf, g.kind);
 				if graphs {
 					println!("      graph[{}] type {}{target}: {}", g.index, g.kind, points(&g.points));
 				} else {
@@ -950,8 +1066,8 @@ fn graph_target(acf: &Acf, kind: i64) -> String {
 		.map_or(String::new(), |b| format!(" (send to {b})"))
 }
 
-pub fn usm(path: &Path) -> Result<()> {
-	let u = Usm::open(path)?;
+fn usm(u: &Usm, len: usize) -> Result<()> {
+	println!("USM, {len} bytes");
 	if let Some(v) = u.video {
 		println!(
 			"video {} {}x{} (shown {}x{}) at {:.3} fps, {} frames, alpha type {}",

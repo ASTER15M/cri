@@ -31,6 +31,32 @@ enum Cmd {
 		#[arg(short, long)]
 		long: bool,
 	},
+	/// Show what a file holds.
+	///
+	/// An ACB's cues and waveforms, an AWB's entries, an ACF's categories, DSP bus settings, AISACs,
+	/// REACT rules, selectors and voice limits, or a USM's streams. With no section named, every
+	/// section.
+	Info {
+		file: PathBuf,
+		/// Only the cues with one of these IDs or whose names contain one, ignoring case, and their
+		/// waveforms. ACB only.
+		patterns: Vec<String>,
+		/// The cues, one line each. ACB only.
+		#[arg(long)]
+		cues: bool,
+		/// The waveforms, beside each bitstream's own header. ACB or AWB.
+		#[arg(long)]
+		waves: bool,
+		/// Each cue's program in full: parameters, tracks, layers, AISACs and action tracks. ACB
+		/// only; implies --cues.
+		#[arg(long)]
+		full: bool,
+		/// AISAC graph points too. ACB or ACF; for an ACB, implies --full.
+		#[arg(long)]
+		graphs: bool,
+		#[command(flatten)]
+		awb: AwbArg,
+	},
 	/// Browse @UTF tables.
 	///
 	/// The @UTF tables of an ACB or ACF: the root's tables, or the rows of one of them.
@@ -51,55 +77,6 @@ enum Cmd {
 		#[arg(short, long, default_value_t = 20)]
 		limit: usize,
 	},
-	/// List an ACB's cues.
-	///
-	/// One line per cue: id, name, length, sequence type, layers and categories.
-	Cues {
-		acb: PathBuf,
-		/// Only cues whose name contains this, ignoring case.
-		filter: Option<String>,
-		#[command(flatten)]
-		awb: AwbArg,
-	},
-	/// Show a cue's program.
-	///
-	/// A cue's program in full: every scope's parameters, tracks, layers, AISACs and action tracks.
-	Cue {
-		acb: PathBuf,
-		/// Cue names or numeric cue IDs.
-		#[arg(required = true)]
-		cues: Vec<String>,
-		/// Also print each AISAC's graph points.
-		#[arg(long)]
-		graphs: bool,
-		#[command(flatten)]
-		awb: AwbArg,
-	},
-	/// List an ACB's waveforms.
-	///
-	/// An ACB's waveforms, with the header of each bitstream beside what the ACB says.
-	Waves {
-		acb: PathBuf,
-		#[command(flatten)]
-		awb: AwbArg,
-	},
-	/// List an AWB's entries.
-	///
-	/// An AWB's entries, with each bitstream's header.
-	Awb { awb: PathBuf },
-	/// Show an ACF's settings.
-	///
-	/// An ACF's categories, DSP bus settings, AISACs, REACT rules, selectors and voice limits.
-	Acf {
-		acf: PathBuf,
-		/// Also print each global AISAC's graph points.
-		#[arg(long)]
-		graphs: bool,
-	},
-	/// Show a USM's streams.
-	///
-	/// A USM's streams, video format and chunks.
-	Usm { usm: PathBuf },
 	/// Decode HCA or ADX to WAV.
 	///
 	/// Decode an HCA or ADX file to WAV.
@@ -191,15 +168,13 @@ fn main() -> Result<()> {
 	}));
 	match Args::parse().cmd {
 		Cmd::Ls { paths, recursive, long } => explore::ls(&paths, recursive, long),
+		Cmd::Info { file, patterns, cues, waves, full, graphs, awb } => {
+			let o = explore::Info { patterns, cues, waves, full, graphs, awb: awb.awb };
+			explore::info(&file, o)
+		}
 		Cmd::Utf { file, table, schema, columns, row, limit } => {
 			explore::utf(&file, table.as_deref(), schema, &columns, row, limit)
 		}
-		Cmd::Cues { acb, filter, awb } => explore::cues(&acb, awb.awb, filter.as_deref()),
-		Cmd::Cue { acb, cues, graphs, awb } => explore::cue(&acb, awb.awb, &cues, graphs),
-		Cmd::Waves { acb, awb } => explore::waves(&acb, awb.awb),
-		Cmd::Awb { awb } => explore::awb(&awb),
-		Cmd::Acf { acf, graphs } => explore::acf(&acf, graphs),
-		Cmd::Usm { usm } => explore::usm(&usm),
 		Cmd::Decode { input, out, subkey, key, format } => {
 			let out = out.unwrap_or_else(|| input.with_extension("wav"));
 			write::decode(&input, &out, key.key, subkey, format.pcm16)

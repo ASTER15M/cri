@@ -22,13 +22,8 @@ Every fallible function returns `cri::Error`, which says which format the input 
 | command   | what                                                                     |
 | --------- | ------------------------------------------------------------------------ |
 | `ls`      | the CRI files in a directory or among files, one line each               |
+| `info`    | what a file holds: cues, waveforms, archive entries, buses or streams    |
 | `utf`     | an ACB's or ACF's `@UTF` tables, their schemas and rows                  |
-| `cues`    | an ACB's cues, one line each                                             |
-| `cue`     | one cue's program: parameters, tracks, layers, AISACs and action tracks  |
-| `waves`   | an ACB's waveforms, beside their bitstreams' own headers                 |
-| `awb`     | an AWB's entries                                                         |
-| `acf`     | an ACF's categories, buses, effects, AISACs, REACT rules and selectors   |
-| `usm`     | a USM's streams and video format                                         |
 | `decode`  | an HCA or ADX file to WAV                                                |
 | `extract` | every waveform of an ACB or AWB, to WAV or as stored                     |
 | `demux`   | a USM's video, audio and alpha streams                                   |
