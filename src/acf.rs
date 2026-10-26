@@ -134,7 +134,8 @@ pub struct GlobalAisac {
 	pub index: usize,
 	pub name: String,
 	pub control_id: u32,
-	pub has_default: bool,
+	// `DefaultControl`, when `DefaultControlFlag` is set: the control's value until one is written
+	pub default_control: Option<f32>,
 	pub auto_modulation_index: Option<usize>,
 	pub graphs: Vec<Graph>,
 }
@@ -198,7 +199,8 @@ impl Acf {
 				index: i,
 				name: global_names[i].clone(),
 				control_id: global.get_i64(i, "ControlId").unwrap_or(0) as u32,
-				has_default: global.get_i64(i, "DefaultControlFlag").unwrap_or(0) != 0,
+				default_control: (global.get_i64(i, "DefaultControlFlag").unwrap_or(0) != 0)
+					.then(|| global.get_f32(i, "DefaultControl").unwrap_or(0.0)),
 				auto_modulation_index: index(global.get_i64(i, "AutoModulationIndex")),
 				graphs: global.get_indexes(i, "GraphIndexes").iter().map(|&g| graph(&graphs, g)).collect(),
 			})

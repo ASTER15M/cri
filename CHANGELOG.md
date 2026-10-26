@@ -25,6 +25,14 @@ is a breaking change and a patch bump (0.1.0 → 0.1.1) is not.
   volumes, effects (`Effect::matrix` decodes a `Matrix`) and sends, global AISACs with their graphs,
   the bus list AISAC graph types count through, REACT rules, selectors and voice limit groups.
 - `CueParam::CueLimit::kind` is optional: a category's code 73 carries none.
+- `asr` renders the Atom sound renderer's float output offline: sound commands in, planes out, on
+  the native pass grid. Voices mix into the buses of an ACF's DSP setting, run in graph order once
+  per production block: a bus is live when a send reaches it with a non-zero gain or an `Echo`
+  still has a tail, only a live bus adds the anti-denormal pulse and sends, and a category's global
+  AISACs scale the sends their graphs target. `Approximated` counts what is rendered other than the
+  library would; cues with features it does not model fail with `Error::Unrenderable`.
+- `Error::Unrenderable` and `Error::Command`, for `asr`.
+- `acf::GlobalAisac::default_control` replaces `has_default` and carries the value.
 
 ## 0.1.0
 

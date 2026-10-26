@@ -56,6 +56,10 @@ pub enum Error {
 	ChecksumMismatch,
 	// No cue has this name or id
 	NoSuchCue(String),
+	// Something `asr` does not render: a cue's feature, an ACF bus graph's
+	Unrenderable { what: String },
+	// A command `asr` cannot apply where it is
+	Command { tick: u64, player: usize, reason: String },
 	// Building the program of cue `index` failed
 	Cue { index: usize, name: String, source: Box<Error> },
 	Io { path: PathBuf, source: std::io::Error },
@@ -70,6 +74,9 @@ impl Error {
 	}
 	pub(crate) fn unsupported(format: Format, feature: impl Into<String>) -> Self {
 		Self::Unsupported { format, feature: feature.into() }
+	}
+	pub(crate) fn unrenderable(what: impl Into<String>) -> Self {
+		Self::Unrenderable { what: what.into() }
 	}
 
 	// The error under any `Cue` wrapping
@@ -94,6 +101,8 @@ impl fmt::Display for Error {
 			}
 			Self::MissingKeycode { format } => write!(f, "{format}: encrypted, and no keycode was given"),
 			Self::ChecksumMismatch => f.write_str("HCA: block failed its CRC"),
+			Self::Unrenderable { what } => write!(f, "not rendered: {what}"),
+			Self::Command { tick, player, reason } => write!(f, "tick {tick}, player {player}: {reason}"),
 			Self::NoSuchCue(cue) => write!(f, "{cue}: no such cue"),
 			Self::Cue { index, name, .. } if name.is_empty() => write!(f, "cue [{index}]"),
 			Self::Cue { index, name, .. } => write!(f, "cue [{index}] {name}"),

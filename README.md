@@ -2,15 +2,16 @@
 
 CRI Middleware's containers and codecs in plain Rust.
 
-| module | what                                                                    |
-| ------ | ----------------------------------------------------------------------- |
-| `utf`  | `@UTF` tables, the format inside ACB, ACF and USM headers               |
-| `acb`  | cue banks: cue sheets, waveforms, and the cue programs (`acb::program`) |
+| module | what                                                                     |
+| ------ | ------------------------------------------------------------------------ |
+| `utf`  | `@UTF` tables, the format inside ACB, ACF and USM headers                |
+| `acb`  | cue banks: cue sheets, waveforms, and the cue programs (`acb::program`)  |
 | `acf`  | project settings: categories, DSP buses and their effects, AISACs, REACT |
-| `afs2` | AWB archives, and the subkey they carry                                 |
-| `adx`  | ADX decoding, including type 9 encryption                               |
-| `hca`  | HCA decoding, including cipher types 0, 1 and 56                        |
-| `usm`  | USM demuxing and unmasking; `usm::ivf` frames its VP9 streams           |
+| `asr`  | the sound renderer's mix, offline: cues through an ACF's bus graph       |
+| `afs2` | AWB archives, and the subkey they carry                                  |
+| `adx`  | ADX decoding, including type 9 encryption                                |
+| `hca`  | HCA decoding, including cipher types 0, 1 and 56                         |
+| `usm`  | USM demuxing and unmasking; `usm::ivf` frames its VP9 streams            |
 
 Every fallible function returns `cri::Error`, which says which format the input broke and how.
 
