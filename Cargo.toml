@@ -1,0 +1,7 @@
+[package]
+name = "cri"
+version = "0.1.0"
+edition = "2024"
+description = "CRI Middleware containers and codecs: ACB, AWB, UTF, ADX, HCA and USM"
+publish = false
+
