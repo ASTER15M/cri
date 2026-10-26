@@ -17,8 +17,22 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Cmd {
-	/// What each file is, at a glance: ACB, ACF, AWB, USM, HCA, ADX or a bare @UTF table.
-	Info { files: Vec<PathBuf> },
+	/// List CRI files.
+	///
+	/// One line per file. A directory lists the files in it that read as CRI files: ACB, ACF, AWB,
+	/// USM, HCA, ADX or a bare @UTF table.
+	Ls {
+		/// Files and directories; defaults to the current directory.
+		paths: Vec<PathBuf>,
+		/// List the directories under each directory too.
+		#[arg(short, long)]
+		recursive: bool,
+		/// Several lines per file: versions, sizes, codecs and archives.
+		#[arg(short, long)]
+		long: bool,
+	},
+	/// Browse @UTF tables.
+	///
 	/// The @UTF tables of an ACB or ACF: the root's tables, or the rows of one of them.
 	Utf {
 		file: PathBuf,
@@ -37,6 +51,8 @@ enum Cmd {
 		#[arg(short, long, default_value_t = 20)]
 		limit: usize,
 	},
+	/// List an ACB's cues.
+	///
 	/// One line per cue: id, name, length, sequence type, layers and categories.
 	Cues {
 		acb: PathBuf,
@@ -45,6 +61,8 @@ enum Cmd {
 		#[command(flatten)]
 		awb: AwbArg,
 	},
+	/// Show a cue's program.
+	///
 	/// A cue's program in full: every scope's parameters, tracks, layers, AISACs and action tracks.
 	Cue {
 		acb: PathBuf,
@@ -57,14 +75,20 @@ enum Cmd {
 		#[command(flatten)]
 		awb: AwbArg,
 	},
+	/// List an ACB's waveforms.
+	///
 	/// An ACB's waveforms, with the header of each bitstream beside what the ACB says.
 	Waves {
 		acb: PathBuf,
 		#[command(flatten)]
 		awb: AwbArg,
 	},
+	/// List an AWB's entries.
+	///
 	/// An AWB's entries, with each bitstream's header.
 	Awb { awb: PathBuf },
+	/// Show an ACF's settings.
+	///
 	/// An ACF's categories, DSP bus settings, AISACs, REACT rules, selectors and voice limits.
 	Acf {
 		acf: PathBuf,
@@ -72,8 +96,12 @@ enum Cmd {
 		#[arg(long)]
 		graphs: bool,
 	},
+	/// Show a USM's streams.
+	///
 	/// A USM's streams, video format and chunks.
 	Usm { usm: PathBuf },
+	/// Decode HCA or ADX to WAV.
+	///
 	/// Decode an HCA or ADX file to WAV.
 	Decode {
 		input: PathBuf,
@@ -88,6 +116,8 @@ enum Cmd {
 		#[command(flatten)]
 		format: FormatArg,
 	},
+	/// Extract an ACB's or AWB's waveforms.
+	///
 	/// Write every waveform of an ACB or AWB to a directory, decoded to WAV or as stored.
 	Extract {
 		/// An ACB, whose files are named by the first cue that plays them, or an AWB.
@@ -108,6 +138,8 @@ enum Cmd {
 		#[command(flatten)]
 		format: FormatArg,
 	},
+	/// Split a USM into streams.
+	///
 	/// Split a USM into its video, audio and alpha streams.
 	Demux {
 		usm: PathBuf,
@@ -149,8 +181,16 @@ fn parse_key(s: &str) -> Result<u64> {
 }
 
 fn main() -> Result<()> {
+	// Output piped into `head` stops being read; that ends the listing, not with a panic.
+	let default = std::panic::take_hook();
+	std::panic::set_hook(Box::new(move |info| {
+		if info.payload_as_str().is_some_and(|m| m.starts_with("failed printing to stdout")) {
+			std::process::exit(0);
+		}
+		default(info);
+	}));
 	match Args::parse().cmd {
-		Cmd::Info { files } => explore::info(&files),
+		Cmd::Ls { paths, recursive, long } => explore::ls(&paths, recursive, long),
 		Cmd::Utf { file, table, schema, columns, row, limit } => {
 			explore::utf(&file, table.as_deref(), schema, &columns, row, limit)
 		}

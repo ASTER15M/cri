@@ -21,7 +21,7 @@ Every fallible function returns `cri::Error`, which says which format the input 
 
 | command   | what                                                                     |
 | --------- | ------------------------------------------------------------------------ |
-| `info`    | what each file is, at a glance                                           |
+| `ls`      | the CRI files in a directory or among files, one line each               |
 | `utf`     | an ACB's or ACF's `@UTF` tables, their schemas and rows                  |
 | `cues`    | an ACB's cues, one line each                                             |
 | `cue`     | one cue's program: parameters, tracks, layers, AISACs and action tracks  |

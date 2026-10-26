@@ -1,4 +1,4 @@
-// The read-only commands: what a file is, its tables, cues, waveforms, buses and streams
+// The read-only commands: what files are, their tables, cues, waveforms, buses and streams
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -126,19 +126,203 @@ fn seconds(ms: i64) -> String {
 	if ms < 0 { "indeterminate".into() } else { format!("{:.3} s", ms as f64 / 1000.0) }
 }
 
-pub fn info(files: &[PathBuf]) -> Result<()> {
-	for (i, path) in files.iter().enumerate() {
-		if i > 0 {
-			println!();
-		}
-		println!("{}", path.display());
-		let bytes = read(path)?;
-		match summarize(path, bytes) {
-			Ok(lines) => lines.iter().for_each(|l| println!("  {l}")),
-			Err(e) => println!("  unreadable: {e:#}"),
+// The CRI files among `paths`, one line each, or `summarize`'s lines with `long`. A directory lists
+// the files in it that read as CRI files; a file named outright is always listed.
+pub fn ls(paths: &[PathBuf], recursive: bool, long: bool) -> Result<()> {
+	let here = [PathBuf::from(".")];
+	let paths = if paths.is_empty() { &here[..] } else { paths };
+	for (n, path) in paths.iter().enumerate() {
+		let files = if path.is_dir() {
+			if paths.len() > 1 {
+				println!(
+					"{}{}:",
+					if n > 0 {
+						"
+"
+					} else {
+						""
+					},
+					path.display()
+				);
+			}
+			let mut files = Vec::new();
+			walk(path, recursive, &mut files);
+			files.sort();
+			files
+				.into_iter()
+				.map(|f| {
+					let name = f.strip_prefix(path).unwrap_or(&f).display().to_string();
+					(if f.is_dir() { format!("{name}/") } else { name }, f, false)
+				})
+				.collect()
+		} else {
+			vec![(path.display().to_string(), path.clone(), true)]
+		};
+		let lines: Vec<(String, Vec<String>)> = files
+			.into_iter()
+			.filter_map(|(name, path, named)| {
+				let lines = if long { long_lines(&path, named) } else { line(&path, named) };
+				lines.map(|l| (name, l))
+			})
+			.collect();
+		let width = lines.iter().map(|(name, _)| name.chars().count()).max().unwrap_or(0);
+		for (i, (name, l)) in lines.iter().enumerate() {
+			if long {
+				if i > 0 {
+					println!();
+				}
+				println!("{name}");
+				l.iter().for_each(|l| println!("  {l}"));
+			} else if let [l] = &l[..] {
+				println!("{name:<width$}  {l}");
+			} else {
+				println!("{name}");
+			}
 		}
 	}
 	Ok(())
+}
+
+// Every file under `dir`, or without `recursive` its files and directories; a directory that cannot
+// be read is reported and skipped.
+fn walk(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) {
+	let entries = match std::fs::read_dir(dir) {
+		Ok(e) => e,
+		Err(e) => return eprintln!("{}: {e}", dir.display()),
+	};
+	for e in entries.flatten() {
+		let path = e.path();
+		match e.file_type() {
+			// Linked directories are not followed, as `ls -R` does not.
+			Ok(t) if t.is_dir() => {
+				if recursive {
+					walk(&path, recursive, out);
+				} else {
+					out.push(path);
+				}
+			}
+			Ok(_) if path.is_file() => out.push(path),
+			_ => {}
+		}
+	}
+}
+
+// Enough of a file to tell what it is and read the headers of an HCA, ADX, AWB or USM
+const HEAD: u64 = 64 * 1024;
+
+fn read_head(path: &Path) -> Result<Vec<u8>> {
+	use std::io::Read as _;
+	let f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+	let mut head = Vec::new();
+	f.take(HEAD).read_to_end(&mut head).with_context(|| format!("reading {}", path.display()))?;
+	Ok(head)
+}
+
+// Whether a file found in a directory is listed. `0x80 0x00` starts many files that are not ADX.
+fn is_cri(head: &[u8]) -> bool {
+	match sniff(head) {
+		Kind::Unknown => false,
+		Kind::Adx => AdxHeader::parse(head).is_ok(),
+		_ => true,
+	}
+}
+
+fn line(path: &Path, named: bool) -> Option<Vec<String>> {
+	if path.is_dir() {
+		return Some(Vec::new());
+	}
+	let head = match read_head(path) {
+		Ok(h) => h,
+		Err(e) => return Some(vec![format!("unreadable: {e:#}")]),
+	};
+	if !named && !is_cri(&head) {
+		return None;
+	}
+	let kind = sniff(&head);
+	Some(vec![brief(path, &head).unwrap_or_else(|e| format!("{kind}, unreadable: {e:#}"))])
+}
+
+fn long_lines(path: &Path, named: bool) -> Option<Vec<String>> {
+	if path.is_dir() {
+		return Some(Vec::new());
+	}
+	if !named && !read_head(path).is_ok_and(|h| is_cri(&h)) {
+		return None;
+	}
+	Some(match read(path).and_then(|b| summarize(path, b)) {
+		Ok(lines) => lines,
+		Err(e) => vec![format!("unreadable: {e:#}")],
+	})
+}
+
+// A file in one line, from its first `HEAD` bytes; an ACB or ACF is read whole.
+fn brief(path: &Path, head: &[u8]) -> Result<String> {
+	Ok(match sniff(head) {
+		Kind::Utf => {
+			let bytes = read(path)?;
+			let root = Utf::parse(&bytes)?;
+			let has = |c: &str| root.columns.iter().any(|col| col.name == c);
+			if has("CueTable") {
+				let acb = Acb::from_bytes(bytes)?;
+				let cues = acb.table("CueTable").transpose()?.map_or(0, |t| t.rows.len());
+				let waves = acb.waveforms();
+				let missing = waves.iter().any(|w| w.streaming) && !path.with_extension("awb").is_file();
+				format!(
+					"ACB {:?}, {cues} cue(s), {} waveform(s){}",
+					acb.name,
+					waves.len(),
+					if missing { ", streaming AWB missing" } else { "" }
+				)
+			} else if has("DspSettingTable") || has("CategoryTable") {
+				let acf = Acf::from_bytes(&bytes)?;
+				format!(
+					"ACF {:?}, {} categories, {} DSP setting(s)",
+					acf.name,
+					acf.categories.len(),
+					acf.dsp_settings.len()
+				)
+			} else {
+				format!("@UTF table {:?}, {} row(s)", root.name, root.rows.len())
+			}
+		}
+		// The count and subkey sit in the 16-byte header; `Afs2::parse` needs the whole archive.
+		Kind::Afs2 if head.len() >= 16 => {
+			let count = u32::from_le_bytes(head[8..12].try_into().unwrap());
+			let subkey = u16::from_le_bytes(head[14..16].try_into().unwrap());
+			format!("AWB, {count} entries, subkey {subkey}")
+		}
+		Kind::Usm => {
+			let u = Usm::parse(usm_head(head).to_vec())?;
+			let audio = u.dir.iter().any(|e| &e.stmid.to_be_bytes() == b"@SFA");
+			let audio = if audio { ", with audio" } else { "" };
+			match u.video {
+				Some(v) => format!(
+					"USM, {} {}x{} at {:.3} fps, {} frames{}{audio}",
+					v.codec_name(),
+					v.width,
+					v.height,
+					v.fps(),
+					v.total_frames,
+					if v.alpha_type != 0 { ", with alpha" } else { "" }
+				),
+				None => format!("USM, no video header in its first {HEAD} bytes{audio}"),
+			}
+		}
+		_ => describe(head),
+	})
+}
+
+// The whole chunks a USM's head holds, so that its headers parse without its streams
+fn usm_head(b: &[u8]) -> &[u8] {
+	let mut end = 0;
+	while let Some(size) = b.get(end + 4..end + 8) {
+		let next = end + 8 + u32::from_be_bytes(size.try_into().unwrap()) as usize;
+		if next > b.len() {
+			break;
+		}
+		end = next;
+	}
+	&b[..end]
 }
 
 fn summarize(path: &Path, bytes: Vec<u8>) -> Result<Vec<String>> {
