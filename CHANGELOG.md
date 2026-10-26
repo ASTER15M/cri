@@ -3,7 +3,7 @@
 Every release is tagged `v<version>`. Versions follow semver; before 1.0, a minor bump (0.1 → 0.2)
 is a breaking change and a patch bump (0.1.0 → 0.1.1) is not.
 
-## Unreleased
+## 0.2.0
 
 - **Breaking:** `acb::program` decodes every parameter command. Those with a known meaning have
   their own `CueParam` variant: cue limits, combo-sequential settings, the replay interval, biquad
