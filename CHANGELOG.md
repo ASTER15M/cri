@@ -33,7 +33,8 @@ is a breaking change and a patch bump (0.1.0 → 0.1.1) is not.
   library would; cues with features it does not model fail with `Error::Unrenderable`.
 - `Error::Unrenderable` and `Error::Command`, for `asr`.
 - `acf::GlobalAisac::default_control` replaces `has_default` and carries the value.
-- `acb::parse_commands` is public.
+- `acb::parse_commands` is public, and so are `Utf`'s typed getters and `Value::as_i64` and
+  `as_bytes`. `acb` re-exports `AwbSource`, `CueProgram` and `Layer`.
 
 ## 0.1.0
 

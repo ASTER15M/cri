@@ -20,7 +20,7 @@ pub enum Value {
 }
 
 impl Value {
-	pub(crate) fn as_i64(&self) -> Option<i64> {
+	pub fn as_i64(&self) -> Option<i64> {
 		Some(match self {
 			Self::U8(v) => *v as i64,
 			Self::I8(v) => *v as i64,
@@ -36,7 +36,7 @@ impl Value {
 	pub fn as_str(&self) -> Option<&str> {
 		if let Self::Str(s) = self { Some(s) } else { None }
 	}
-	fn as_bytes(&self) -> Option<&[u8]> {
+	pub fn as_bytes(&self) -> Option<&[u8]> {
 		if let Self::Data(d) = self { Some(d) } else { None }
 	}
 }
@@ -202,28 +202,28 @@ impl Utf {
 		let c = self.columns.iter().position(|c| c.name == name)?;
 		self.rows.get(row)?.get(c)
 	}
-	pub(crate) fn get_i64(&self, row: usize, name: &str) -> Option<i64> {
+	pub fn get_i64(&self, row: usize, name: &str) -> Option<i64> {
 		self.get(row, name)?.as_i64()
 	}
-	pub(crate) fn get_f32(&self, row: usize, name: &str) -> Option<f32> {
+	pub fn get_f32(&self, row: usize, name: &str) -> Option<f32> {
 		match self.get(row, name)? {
 			Value::F32(v) => Some(*v),
 			_ => None,
 		}
 	}
-	pub(crate) fn get_str(&self, row: usize, name: &str) -> Option<&str> {
+	pub fn get_str(&self, row: usize, name: &str) -> Option<&str> {
 		self.get(row, name)?.as_str()
 	}
 	pub fn get_bytes(&self, row: usize, name: &str) -> Option<&[u8]> {
 		self.get(row, name)?.as_bytes()
 	}
 	// A cell holding a nested table; `None` when it is empty, as a table with no rows is
-	pub(crate) fn get_table(&self, row: usize, name: &str) -> Option<Result<Self>> {
+	pub fn get_table(&self, row: usize, name: &str) -> Option<Result<Self>> {
 		let d = self.get_bytes(row, name)?;
 		(!d.is_empty()).then(|| Self::parse(d))
 	}
 	// A cell of big-endian `u16` indexes into another table
-	pub(crate) fn get_indexes(&self, row: usize, name: &str) -> Vec<usize> {
+	pub fn get_indexes(&self, row: usize, name: &str) -> Vec<usize> {
 		let b = self.get_bytes(row, name).unwrap_or_default();
 		b.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes(*c) as usize).collect()
 	}

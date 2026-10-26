@@ -5,7 +5,7 @@
 
 pub mod program;
 
-pub use program::{CueParam, CueSheet};
+pub use program::{AwbSource, CueParam, CueProgram, CueSheet, Layer};
 
 use crate::error::{Error, Format, Result, ensure};
 
