@@ -1,0 +1,797 @@
+// The read-only commands: what a file is, its tables, cues, waveforms, buses and streams
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use cri::acb::program::{
+	ActionEvent, ActionTarget, CueParam, CueSheet, NestedSequence, ProgramTrack, SequenceType,
+};
+use cri::acb::{Acb, AwbSource};
+use cri::acf::Acf;
+use cri::adx::AdxHeader;
+use cri::afs2::Afs2;
+use cri::hca::HcaHeader;
+use cri::usm::Usm;
+use cri::utf::{Utf, Value};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+	Utf,
+	Afs2,
+	Usm,
+	Hca,
+	Adx,
+	Unknown,
+}
+
+impl std::fmt::Display for Kind {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(match self {
+			Self::Utf => "@UTF",
+			Self::Afs2 => "AWB",
+			Self::Usm => "USM",
+			Self::Hca => "HCA",
+			Self::Adx => "ADX",
+			Self::Unknown => "unknown",
+		})
+	}
+}
+
+pub fn sniff(b: &[u8]) -> Kind {
+	let masked: Vec<u8> = b.iter().take(4).map(|c| c & 0x7f).collect();
+	match b {
+		_ if b.starts_with(b"@UTF") => Kind::Utf,
+		_ if b.starts_with(b"AFS2") => Kind::Afs2,
+		_ if b.starts_with(b"CRID") => Kind::Usm,
+		_ if masked == b"HCA\0" => Kind::Hca,
+		[0x80, 0x00, ..] => Kind::Adx,
+		_ => Kind::Unknown,
+	}
+}
+
+// A bitstream's own header in one line
+pub fn describe(b: &[u8]) -> String {
+	match sniff(b) {
+		Kind::Hca => match HcaHeader::parse(b) {
+			Ok(h) => {
+				let mut s = format!(
+					"HCA {}.{} {}ch {} Hz {:.2} s, cipher {}",
+					h.version >> 8,
+					h.version & 0xff,
+					h.channels,
+					h.sample_rate,
+					h.total_samples() as f64 / f64::from(h.sample_rate.max(1)),
+					h.ciph_type
+				);
+				if let Some(l) = h.loop_info {
+					let at = |n: i64| n as f64 / f64::from(h.sample_rate.max(1));
+					s += &format!(", loop {:.3}..{:.3} s", at(l.start_sample(&h)), at(l.end_sample(&h)));
+				}
+				s
+			}
+			Err(e) => format!("HCA, unreadable: {e}"),
+		},
+		Kind::Adx => match AdxHeader::parse(b) {
+			Ok(h) => {
+				let mut s = format!(
+					"ADX v{} {}ch {} Hz {:.2} s, encryption type {}",
+					h.version,
+					h.channels,
+					h.sample_rate,
+					f64::from(h.sample_count) / f64::from(h.sample_rate.max(1)),
+					h.encoding_type
+				);
+				if let Some(l) = h.loop_info {
+					let at = |n: u32| f64::from(n) / f64::from(h.sample_rate.max(1));
+					s += &format!(", loop {:.3}..{:.3} s", at(l.start_sample), at(l.end_sample));
+				}
+				s
+			}
+			Err(e) => format!("ADX, unreadable: {e}"),
+		},
+		Kind::Unknown => format!("unknown, starts {}", hex(&b[..b.len().min(8)])),
+		kind => kind.to_string(),
+	}
+}
+
+fn hex(b: &[u8]) -> String {
+	b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn read(path: &Path) -> Result<Vec<u8>> {
+	std::fs::read(path).with_context(|| format!("reading {}", path.display()))
+}
+
+// The given AWB, or the `.awb` beside the ACB when there is one
+pub fn load_awb(acb: &Path, awb: Option<PathBuf>) -> Result<Option<Vec<u8>>> {
+	match awb {
+		Some(p) => read(&p).map(Some),
+		None => {
+			let p = acb.with_extension("awb");
+			Ok(if p.is_file() { Some(read(&p)?) } else { None })
+		}
+	}
+}
+
+fn open_sheet<'a>(acb: &'a Acb, awb: Option<Vec<u8>>) -> Result<CueSheet<'a>> {
+	let sheet = CueSheet::open(acb)?;
+	Ok(match awb {
+		Some(b) => sheet.with_external_awb(b)?,
+		None => sheet,
+	})
+}
+
+fn seconds(ms: i64) -> String {
+	if ms < 0 { "indeterminate".into() } else { format!("{:.3} s", ms as f64 / 1000.0) }
+}
+
+pub fn info(files: &[PathBuf]) -> Result<()> {
+	for (i, path) in files.iter().enumerate() {
+		if i > 0 {
+			println!();
+		}
+		println!("{}", path.display());
+		let bytes = read(path)?;
+		match summarize(path, bytes) {
+			Ok(lines) => lines.iter().for_each(|l| println!("  {l}")),
+			Err(e) => println!("  unreadable: {e:#}"),
+		}
+	}
+	Ok(())
+}
+
+fn summarize(path: &Path, bytes: Vec<u8>) -> Result<Vec<String>> {
+	let len = bytes.len();
+	let mut out = Vec::new();
+	match sniff(&bytes) {
+		Kind::Utf => {
+			let root = Utf::parse(&bytes)?;
+			let has = |c: &str| root.columns.iter().any(|col| col.name == c);
+			let version = root.get_i64(0, "Version").map(|v| format!("{v:#010x}")).unwrap_or_default();
+			if has("CueTable") {
+				let acb = Acb::from_bytes(bytes)?;
+				let waves = acb.waveforms();
+				out.push(format!("ACB {:?}, version {version}, {len} bytes", acb.name));
+				let cues = acb.table("CueTable").transpose()?.map_or(0, |t| t.rows.len());
+				out.push(format!("{cues} cue(s), {} waveform(s)", waves.len()));
+				let mut codecs = BTreeMap::<String, usize>::new();
+				for w in &waves {
+					let at = if w.streaming { "streaming" } else { "in memory" };
+					*codecs.entry(format!("{} {at}", w.codec_name())).or_default() += 1;
+				}
+				for (codec, n) in codecs {
+					out.push(format!("  {n:>5} {codec}"));
+				}
+				if let Some(awb) = acb.internal_awb().transpose()? {
+					out.push(format!(
+						"embedded AWB: {} entries, subkey {}",
+						awb.0.entries.len(),
+						awb.0.subkey
+					));
+				}
+				if waves.iter().any(|w| w.streaming) {
+					let p = path.with_extension("awb");
+					let state = if p.is_file() { "beside it" } else { "not beside it" };
+					out.push(format!("streaming AWB {} is {state}", p.display()));
+				}
+			} else if has("DspSettingTable") || has("CategoryTable") {
+				let acf = Acf::from_bytes(&bytes)?;
+				out.push(format!(
+					"ACF {:?}, version {:#010x} ({}), {len} bytes",
+					acf.name, acf.version, acf.version_string
+				));
+				out.push(format!(
+					"{} categories, {} DSP setting(s) (default {:?}), {} global AISAC(s), {} REACT rule(s)",
+					acf.categories.len(),
+					acf.dsp_settings.len(),
+					acf.default_dsp_setting,
+					acf.global_aisacs.len(),
+					acf.reacts.len()
+				));
+			} else {
+				out.push(format!(
+					"@UTF table {:?}: {} column(s), {} row(s), {len} bytes",
+					root.name,
+					root.columns.len(),
+					root.rows.len()
+				));
+			}
+		}
+		Kind::Afs2 => {
+			let a = Afs2::parse(&bytes)?;
+			out.push(format!(
+				"AWB: {} entries, alignment {}, subkey {}, {len} bytes",
+				a.entries.len(),
+				a.align,
+				a.subkey
+			));
+			let mut kinds = BTreeMap::<String, usize>::new();
+			for e in &a.entries {
+				*kinds.entry(format!("{}", sniff(&bytes[e.offset..e.offset + e.len]))).or_default() += 1;
+			}
+			for (k, n) in kinds {
+				out.push(format!("  {n:>5} {k}"));
+			}
+		}
+		Kind::Usm => {
+			let u = Usm::parse(bytes)?;
+			out.push(format!("USM, {len} bytes"));
+			if let Some(v) = u.video {
+				out.push(format!(
+					"video {} {}x{} at {:.3} fps, {} frames{}",
+					v.codec_name(),
+					v.width,
+					v.height,
+					v.fps(),
+					v.total_frames,
+					if v.alpha_type != 0 { ", with alpha" } else { "" }
+				));
+			}
+			for e in u.dir.iter().filter(|e| !e.is_container()) {
+				out.push(format!("stream {} {:?}, {} bytes", stream_name(e.stmid), e.filename, e.filesize));
+			}
+		}
+		Kind::Hca | Kind::Adx | Kind::Unknown => out.push(format!("{}, {len} bytes", describe(&bytes))),
+	}
+	Ok(out)
+}
+
+fn stream_name(stmid: u32) -> String {
+	String::from_utf8_lossy(&stmid.to_be_bytes()).into_owned()
+}
+
+// `A/B`: table `B` in the first row of table `A`, itself in the root's row
+fn find_table(root: &Utf, path: &str) -> Result<Utf> {
+	let mut t = root.clone();
+	for step in path.split('/') {
+		t = match t.get_table(0, step) {
+			Some(r) => r.with_context(|| format!("{step} is not a @UTF table"))?,
+			None if t.columns.iter().any(|c| c.name == step) => bail!("{step} is empty"),
+			None => bail!("{} has no column {step}", t.name),
+		};
+	}
+	Ok(t)
+}
+
+pub fn utf(
+	path: &Path,
+	table: Option<&str>,
+	schema: bool,
+	columns: &[String],
+	row: Option<usize>,
+	limit: usize,
+) -> Result<()> {
+	let bytes = read(path)?;
+	let root =
+		Utf::parse(&bytes).with_context(|| format!("{} is not a @UTF file", path.display()))?;
+	let Some(table) = table else {
+		if schema {
+			print_schema(&root);
+			return Ok(());
+		}
+		return print_tree(&root);
+	};
+	let t = find_table(&root, table)?;
+	if schema {
+		print_schema(&t);
+		return Ok(());
+	}
+
+	let rows: Vec<usize> = match row {
+		Some(r) if r >= t.rows.len() => bail!("{} has {} row(s)", t.name, t.rows.len()),
+		Some(r) => vec![r],
+		None => (0..t.rows.len()).take(if limit == 0 { usize::MAX } else { limit }).collect(),
+	};
+	println!("{}: {} row(s)", t.name, t.rows.len());
+	if columns.is_empty() {
+		for &r in &rows {
+			println!("[{r}]");
+			for (c, v) in t.columns.iter().zip(&t.rows[r]) {
+				println!("  {:<28} {}", c.name, cell(v));
+			}
+		}
+	} else {
+		for c in columns {
+			if !t.columns.iter().any(|col| &col.name == c) {
+				bail!("{} has no column {c}", t.name);
+			}
+		}
+		let cells: Vec<Vec<String>> = rows
+			.iter()
+			.map(|&r| columns.iter().map(|c| t.get(r, c).map_or("-".into(), cell)).collect())
+			.collect();
+		let widths: Vec<usize> = (0..columns.len())
+			.map(|i| cells.iter().map(|row| row[i].len()).chain([columns[i].len()]).max().unwrap_or(0))
+			.collect();
+		let line = |r: String, values: &[String]| {
+			let values: Vec<String> =
+				values.iter().zip(&widths).map(|(v, w)| format!("{v:>w$}")).collect();
+			println!("{r:>5}  {}", values.join("  "));
+		};
+		line("row".into(), columns);
+		for (&r, values) in rows.iter().zip(&cells) {
+			line(r.to_string(), values);
+		}
+	}
+	if rows.len() < t.rows.len() && row.is_none() {
+		println!("... {} more row(s); --limit 0 prints all", t.rows.len() - rows.len());
+	}
+	Ok(())
+}
+
+fn cell(v: &Value) -> String {
+	match v {
+		Value::Data(d) if d.starts_with(b"@UTF") => match Utf::parse(d) {
+			Ok(t) => format!("<table {:?}, {} row(s)>", t.name, t.rows.len()),
+			Err(_) => v.to_string(),
+		},
+		v => v.to_string(),
+	}
+}
+
+fn print_schema(t: &Utf) {
+	println!("{}: {} column(s), {} row(s)", t.name, t.columns.len(), t.rows.len());
+	for c in &t.columns {
+		println!("  {:<28} {}", c.name, type_name(c.type_id));
+	}
+}
+
+fn type_name(id: u8) -> &'static str {
+	match id {
+		0x00 => "u8",
+		0x01 => "i8",
+		0x02 => "u16",
+		0x03 => "i16",
+		0x04 => "u32",
+		0x05 => "i32",
+		0x06 => "u64",
+		0x07 => "i64",
+		0x08 => "f32",
+		0x09 => "f64",
+		0x0a => "string",
+		0x0b => "data",
+		_ => "?",
+	}
+}
+
+// The root's scalars and blobs, then every table it holds, with the tables in their first rows
+// indented under them
+fn print_tree(root: &Utf) -> Result<()> {
+	println!("{}: {} column(s), {} row(s)", root.name, root.columns.len(), root.rows.len());
+	for (c, v) in root.columns.iter().zip(root.rows.first().into_iter().flatten()) {
+		if !matches!(v, Value::Data(_)) {
+			println!("  {:<34} {v}", c.name);
+		}
+	}
+	println!();
+	fn tables(t: &Utf, depth: usize) {
+		let Some(row) = t.rows.first() else { return };
+		for (c, v) in t.columns.iter().zip(row) {
+			let Value::Data(d) = v else { continue };
+			let pad = "  ".repeat(depth + 1);
+			let width = 34 - 2 * depth;
+			match Utf::parse(d) {
+				Ok(sub) if d.starts_with(b"@UTF") => {
+					println!("{pad}{:<width$} {:>6} row(s)", c.name, sub.rows.len());
+					tables(&sub, depth + 1);
+				}
+				_ if depth > 0 => {}
+				_ if d.is_empty() => println!("{pad}{:<width$}  empty", c.name),
+				_ => println!("{pad}{:<width$} {:>6} bytes, {}", c.name, d.len(), describe(d)),
+			}
+		}
+	}
+	tables(root, 0);
+	Ok(())
+}
+
+pub fn cues(path: &Path, awb: Option<PathBuf>, filter: Option<&str>) -> Result<()> {
+	let acb = Acb::open(path)?;
+	let sheet = open_sheet(&acb, load_awb(path, awb)?)?;
+	let filter = filter.map(str::to_lowercase);
+	println!(
+		"{:>5} {:>6}  {:<32} {:>13}  {:<12} {:>6}  categories",
+		"index", "id", "name", "length", "sequence", "layers"
+	);
+	let mut refused = 0;
+	for i in 0..sheet.cue_count() {
+		let name = sheet.cue_name(i).unwrap_or("");
+		if let Some(f) = &filter
+			&& !name.to_lowercase().contains(f)
+		{
+			continue;
+		}
+		match sheet.program(i) {
+			Ok(p) => {
+				let layers: usize = p.tracks.iter().map(|t| t.layers.len()).sum();
+				let nested = p.tracks.iter().any(|t| !t.nested.is_empty());
+				let actions = if p.action_tracks.is_empty() { "" } else { " +actions" };
+				println!(
+					"{i:>5} {:>6}  {:<32} {:>13}  {:<12} {:>5}{}  {:?}{actions}",
+					p.cue_id,
+					p.name,
+					seconds(p.length_ms),
+					sequence_name(p.sequence_type),
+					layers,
+					if nested { "+" } else { " " },
+					p.categories()
+				);
+			}
+			Err(e) => {
+				refused += 1;
+				println!("{i:>5} {:>6}  {name:<32} unresolved: {}", "?", e.root());
+			}
+		}
+	}
+	if refused > 0 {
+		println!("{refused} cue(s) did not resolve");
+	}
+	Ok(())
+}
+
+fn sequence_name(t: SequenceType) -> String {
+	match t {
+		SequenceType::Polyphonic => "polyphonic".into(),
+		SequenceType::Random => "random".into(),
+		SequenceType::RandomNoRepeat => "random-norep".into(),
+		SequenceType::ComboSequential => "combo".into(),
+		other => format!("{other:?}"),
+	}
+}
+
+pub fn cue(path: &Path, awb: Option<PathBuf>, wanted: &[String], graphs: bool) -> Result<()> {
+	let acb = Acb::open(path)?;
+	let sheet = open_sheet(&acb, load_awb(path, awb)?)?;
+	for (n, w) in wanted.iter().enumerate() {
+		let index = match w.parse::<i64>() {
+			Ok(id) => sheet.cue_index_by_id(id).with_context(|| format!("no cue has id {id}"))?,
+			Err(_) => sheet.cue_index_by_name(w).with_context(|| format!("no cue is named {w}"))?,
+		};
+		if n > 0 {
+			println!();
+		}
+		let p = sheet.program(index)?;
+		println!("cue {:?}: id {}, index {}", p.name, p.cue_id, p.cue_index);
+		println!("  length {}, layers span {:.1} ms", seconds(p.length_ms), p.span_ms());
+		if let Some(s) = p.sequence_index {
+			println!("  sequence[{s}], {}", sequence_name(p.sequence_type));
+		}
+		let scope = Scope { sheet: &sheet, graphs };
+		scope.params("  ", &p.params, &p.local_aisacs, &p.global_aisacs);
+		scope.tracks("  ", &p.tracks);
+		for a in &p.action_tracks {
+			let target = match &a.target {
+				ActionTarget::Cue { acb_name, cue_id } => format!("cue id {cue_id} of {acb_name:?}"),
+				other => format!("{other:?}"),
+			};
+			println!("  action track[{}] on {target}", a.index);
+			for e in &a.events {
+				match e {
+					ActionEvent::Start { at_ms } => println!("    +{at_ms:>6} ms  start"),
+					ActionEvent::Stop { at_ms } => println!("    +{at_ms:>6} ms  stop"),
+				}
+			}
+		}
+	}
+	Ok(())
+}
+
+struct Scope<'s, 'a> {
+	sheet: &'s CueSheet<'a>,
+	graphs: bool,
+}
+
+impl Scope<'_, '_> {
+	fn params(&self, pad: &str, params: &[CueParam], local: &[usize], global: &[String]) {
+		for p in params {
+			println!("{pad}{}", param(p));
+		}
+		for &a in local {
+			match self.sheet.local_aisac(a) {
+				Some(la) => {
+					println!(
+						"{pad}local AISAC[{}] type {}, control {}, auto-modulation {}, default {}",
+						la.index, la.kind, la.control_id, la.auto_modulation_index, la.has_default
+					);
+					for g in la.graphs.iter().filter(|_| self.graphs) {
+						println!("{pad}  graph[{}] type {}: {}", g.index, g.kind, points(&g.points));
+					}
+				}
+				None => println!("{pad}local AISAC[{a}], not in AisacTable"),
+			}
+		}
+		for g in global {
+			println!("{pad}global AISAC {g:?}");
+		}
+	}
+
+	fn tracks(&self, pad: &str, tracks: &[ProgramTrack]) {
+		for t in tracks {
+			let index = t.track_index.map_or("-".into(), |i| i.to_string());
+			let weight = t.weight.map_or(String::new(), |w| format!(", weight {w}"));
+			let end = t.end_ms.map_or(String::new(), |e| format!(", ends at {e} ms"));
+			println!("{pad}track[{index}]{weight}{end}");
+			let inner = format!("{pad}  ");
+			self.params(&inner, &t.params, &t.local_aisacs, &t.global_aisacs);
+			for l in &t.layers {
+				let synth = l.synth_index.map_or(String::new(), |s| format!(" via synth[{s}]"));
+				let source = match l.source {
+					AwbSource::Internal => "embedded",
+					AwbSource::External => "streaming",
+				};
+				let missing = if l.data.is_some() { "" } else { ", archive not loaded" };
+				println!(
+					"{inner}+{:>6} ms  waveform[{}]{synth}: {} {}ch {} Hz {:.1} ms, {source} #{}{missing}",
+					l.start_ms,
+					l.waveform,
+					codec_name(l.encode_type),
+					l.channels,
+					l.sample_rate,
+					l.duration_ms(),
+					l.awb_id
+				);
+				self.params(&format!("{inner}    "), &l.params, &l.local_aisacs, &[]);
+			}
+			for n in &t.nested {
+				self.nested(&inner, n);
+			}
+		}
+	}
+
+	fn nested(&self, pad: &str, n: &NestedSequence) {
+		let synth = n.synth_index.map_or(String::new(), |s| format!(" via synth[{s}]"));
+		println!(
+			"{pad}+{:>6} ms  sequence[{}]{synth}, {}",
+			n.start_ms,
+			n.sequence_index,
+			sequence_name(n.sequence_type)
+		);
+		let inner = format!("{pad}    ");
+		self.params(&inner, &n.params, &n.local_aisacs, &n.global_aisacs);
+		self.tracks(&inner, &n.tracks);
+	}
+}
+
+fn codec_name(encode_type: i64) -> &'static str {
+	match encode_type {
+		0 => "ADX",
+		2 => "HCA",
+		3 => "HCA-MX",
+		_ => "?",
+	}
+}
+
+fn points(p: &[(f32, u16)]) -> String {
+	let p: Vec<String> =
+		p.iter().map(|(x, y)| format!("({x}, {})", f32::from(*y) / 10000.0)).collect();
+	p.join(" ")
+}
+
+fn param(p: &CueParam) -> String {
+	match p {
+		CueParam::Volume(v) => format!("volume {v}"),
+		CueParam::Pitch(c) => format!("pitch {c} cents"),
+		CueParam::RandomPitch { center_cents, range_cents } => {
+			format!("random pitch {center_cents} ± {range_cents} cents")
+		}
+		CueParam::MaxPitch(c) => format!("max pitch {c} cents"),
+		CueParam::Categories(c) => format!("categories {c:?}"),
+		CueParam::BusSendLevel { bus_name, level, .. } => format!("send {level} to bus {bus_name:?}"),
+		CueParam::CueLimit { instances, slot, kind } => {
+			let kind = kind.map_or(String::new(), |k| format!(", kind {k}"));
+			format!("cue limit {instances} in slot {slot}{kind}")
+		}
+		CueParam::ComboSequential { combo_time_ms, loop_back } => {
+			format!("combo within {combo_time_ms} ms, loops back to track {loop_back}")
+		}
+		CueParam::ReplayInterval { min_ms } => format!("replay interval {min_ms} ms"),
+		CueParam::Biquad { kind, values } => format!("biquad kind {kind} {values:?}"),
+		CueParam::Bandpass { low, high } => format!("band-pass {low}..{high}"),
+		CueParam::Envelope { stage, value, curve } => {
+			let curve = curve.map_or(String::new(), |c| format!(", curve {c:?}"));
+			format!("envelope {stage:?} {value}{curve}")
+		}
+		CueParam::Selector { name } => format!("selector {name:?}"),
+		CueParam::SelectorLabel { selector, label } => format!("only while {selector:?} is {label:?}"),
+		CueParam::Other { table, code, payload } => {
+			format!(
+				"{table} command {code}, payload {}",
+				if payload.is_empty() { "empty".into() } else { hex(payload) }
+			)
+		}
+		other => format!("{other:?}"),
+	}
+}
+
+pub fn waves(path: &Path, awb: Option<PathBuf>) -> Result<()> {
+	let acb = Acb::open(path)?;
+	let embedded = acb.internal_awb().transpose()?;
+	let streaming = load_awb(path, awb)?;
+	let streaming =
+		streaming.as_ref().map(|b| Afs2::parse(b).map(|a| (a, b.as_slice()))).transpose()?;
+	println!(
+		"{:>5}  {:<6} {:>2} {:>6} {:>9}  {:<9} {:>5}  bitstream",
+		"index", "codec", "ch", "rate", "length", "stored", "awb"
+	);
+	for w in acb.waveforms() {
+		let archive = if w.streaming { streaming.as_ref() } else { embedded.as_ref() };
+		let bitstream = match archive {
+			Some((a, b)) => match a.entries.iter().find(|e| i64::from(e.id) == w.awb_id) {
+				Some(e) => describe(&b[e.offset..e.offset + e.len]),
+				None => "not in the archive".into(),
+			},
+			None => "archive not loaded".into(),
+		};
+		println!(
+			"{:>5}  {:<6} {:>2} {:>6} {:>8.2}s  {:<9} {:>5}  {bitstream}",
+			w.index,
+			w.codec_name(),
+			w.channels,
+			w.sample_rate,
+			w.duration_secs(),
+			if w.streaming { "streaming" } else { "embedded" },
+			w.awb_id
+		);
+	}
+	Ok(())
+}
+
+pub fn awb(path: &Path) -> Result<()> {
+	let bytes = read(path)?;
+	let a = Afs2::parse(&bytes)?;
+	println!("{} entries, alignment {}, subkey {}", a.entries.len(), a.align, a.subkey);
+	println!("{:>6} {:>10} {:>9}  bitstream", "id", "offset", "bytes");
+	for e in &a.entries {
+		println!(
+			"{:>6} {:>#10x} {:>9}  {}",
+			e.id,
+			e.offset,
+			e.len,
+			describe(&bytes[e.offset..e.offset + e.len])
+		);
+	}
+	Ok(())
+}
+
+pub fn acf(path: &Path, graphs: bool) -> Result<()> {
+	let acf = Acf::open(path)?;
+	println!("ACF {:?}, version {:#010x} ({})", acf.name, acf.version, acf.version_string);
+
+	println!("\ncategories");
+	for c in &acf.categories {
+		println!("  [{}] id {:<4} {:<24} group {}", c.index, c.id, c.name, c.group);
+		for p in &c.params {
+			println!("        {}", param(p));
+		}
+		for &g in &c.global_aisacs {
+			let name = acf.global_aisacs.get(g).map_or("?", |a| a.name.as_str());
+			println!("        global AISAC[{g}] {name:?}");
+		}
+	}
+
+	for s in &acf.dsp_settings {
+		let default = if s.name == acf.default_dsp_setting { ", the default" } else { "" };
+		println!("\nDSP setting {:?}{default}", s.name);
+		for b in &s.buses {
+			println!("  bus {} {:<16} volume {}", b.number, b.name, b.volume);
+			for e in &b.effects {
+				let name = e.name().map_or_else(|| format!("{:?}", e.kind), str::to_string);
+				let bypass = if e.bypass { ", bypassed" } else { "" };
+				println!("    effect {name}{bypass}, {} parameter bytes", e.parameters.len());
+				if e.matrix().is_none() && !e.parameters.is_empty() && e.parameters.len() % 4 == 0 {
+					let floats: Vec<String> = e.floats().iter().map(f32::to_string).collect();
+					println!("      parameters {}", floats.join(" "));
+				}
+				if let Some(m) = e.matrix() {
+					for (i, row) in m.iter().enumerate() {
+						if row.iter().any(|&g| g != 0.0) {
+							let outs: Vec<String> = row
+								.iter()
+								.enumerate()
+								.filter(|(_, g)| **g != 0.0)
+								.map(|(o, g)| format!("{o}:{g}"))
+								.collect();
+							println!("      in {i} -> {}", outs.join(" "));
+						}
+					}
+				}
+			}
+			for send in &b.sends {
+				println!(
+					"    send {} to {} {:?}, type {}",
+					send.level, send.bus_number, send.bus_name, send.kind
+				);
+			}
+		}
+	}
+
+	if !acf.aisac_controls.is_empty() {
+		println!("\nAISAC controls");
+		for c in &acf.aisac_controls {
+			println!("  {:>5} {}", c.id, c.name);
+		}
+	}
+	if !acf.global_aisacs.is_empty() {
+		println!("\nglobal AISACs");
+		for a in &acf.global_aisacs {
+			let default = a.default_control.map_or(String::new(), |d| format!(", default {d}"));
+			println!("  [{}] {:<28} control {}{default}", a.index, a.name, a.control_id);
+			for g in &a.graphs {
+				let target = graph_target(&acf, g.kind);
+				if graphs {
+					println!("      graph[{}] type {}{target}: {}", g.index, g.kind, points(&g.points));
+				} else {
+					println!("      graph[{}] type {}{target}, {} point(s)", g.index, g.kind, g.points.len());
+				}
+			}
+		}
+	}
+	if !acf.reacts.is_empty() {
+		println!("\nREACT");
+		let name = |i: usize| acf.categories.get(i).map_or("?", |c| c.name.as_str());
+		for r in &acf.reacts {
+			println!(
+				"  {} ducks {} to {}, down {} ms, up {} ms, hold type {} for {} ms",
+				name(r.source),
+				name(r.dest),
+				r.level,
+				r.decrement_ms,
+				r.increment_ms,
+				r.hold_kind,
+				r.hold_ms
+			);
+		}
+	}
+	if !acf.selectors.is_empty() {
+		println!("\nselectors");
+		for s in &acf.selectors {
+			println!("  {}: {}", s.name, s.labels.join(", "));
+		}
+	}
+	if !acf.voice_limit_groups.is_empty() {
+		println!("\nvoice limit groups");
+		for g in &acf.voice_limit_groups {
+			println!("  {:<24} {}", g.name, g.max);
+		}
+	}
+	Ok(())
+}
+
+// Graph types 7 and up drive the send to `aisac_graph_buses[type - 7]`.
+fn graph_target(acf: &Acf, kind: i64) -> String {
+	usize::try_from(kind - 7)
+		.ok()
+		.and_then(|k| acf.aisac_graph_buses.get(k))
+		.map_or(String::new(), |b| format!(" (send to {b})"))
+}
+
+pub fn usm(path: &Path) -> Result<()> {
+	let u = Usm::open(path)?;
+	if let Some(v) = u.video {
+		println!(
+			"video {} {}x{} (shown {}x{}) at {:.3} fps, {} frames, alpha type {}",
+			v.codec_name(),
+			v.width,
+			v.height,
+			v.disp_width,
+			v.disp_height,
+			v.fps(),
+			v.total_frames,
+			v.alpha_type
+		);
+	}
+	println!("\nstreams");
+	for e in &u.dir {
+		let what = if e.is_container() { "container".into() } else { stream_name(e.stmid) };
+		println!(
+			"  {what:<9} channel {:>2} {:<32} {:>10} bytes, {} bit/s",
+			e.chno, e.filename, e.filesize, e.avbps
+		);
+	}
+	println!("\nchunks");
+	for (k, n) in u.chunk_counts() {
+		println!("  {k:<8} {n:>7}");
+	}
+	Ok(())
+}

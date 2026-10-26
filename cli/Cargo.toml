@@ -1,0 +1,15 @@
+[package]
+name = "cri-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Command-line tools over the cri crate: list, explore and decode CRI files"
+publish = false
+
+[[bin]]
+name = "cri"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+cri = { path = ".." }

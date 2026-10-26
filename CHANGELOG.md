@@ -35,6 +35,8 @@ is a breaking change and a patch bump (0.1.0 → 0.1.1) is not.
 - `acf::GlobalAisac::default_control` replaces `has_default` and carries the value.
 - `acb::parse_commands` is public, and so are `Utf`'s typed getters and `Value::as_i64` and
   `as_bytes`. `acb` re-exports `AwbSource`, `CueProgram` and `Layer`.
+- `cli/` builds `cri`, a command-line tool to list and explore ACB, ACF, AWB and USM files and to
+  decode or extract their audio and video streams.
 
 ## 0.1.0
 

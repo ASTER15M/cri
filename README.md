@@ -15,6 +15,26 @@ CRI Middleware's containers and codecs in plain Rust.
 
 Every fallible function returns `cri::Error`, which says which format the input broke and how.
 
+## Tools
+
+`cli/` builds `cri`, a command-line tool over the crate: `cargo install --path cli`.
+
+| command   | what                                                                     |
+| --------- | ------------------------------------------------------------------------ |
+| `info`    | what each file is, at a glance                                           |
+| `utf`     | an ACB's or ACF's `@UTF` tables, their schemas and rows                  |
+| `cues`    | an ACB's cues, one line each                                             |
+| `cue`     | one cue's program: parameters, tracks, layers, AISACs and action tracks  |
+| `waves`   | an ACB's waveforms, beside their bitstreams' own headers                 |
+| `awb`     | an AWB's entries                                                         |
+| `acf`     | an ACF's categories, buses, effects, AISACs, REACT rules and selectors   |
+| `usm`     | a USM's streams and video format                                         |
+| `decode`  | an HCA or ADX file to WAV                                                |
+| `extract` | every waveform of an ACB or AWB, to WAV or as stored                     |
+| `demux`   | a USM's video, audio and alpha streams                                   |
+
+Encrypted files need the keycode, given with `--key` or the `CRI_KEY` environment variable.
+
 ## Accuracy
 
 The ADX and HCA decoders produce the same `f32` samples as CRI's own runtime, bit for bit, on the
