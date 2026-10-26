@@ -64,7 +64,7 @@ impl Command {
 }
 
 // A command stream; trailing bytes after the terminator are ignored.
-pub(crate) fn parse_commands(buf: &[u8]) -> Vec<Command> {
+pub fn parse_commands(buf: &[u8]) -> Vec<Command> {
 	let mut out = Vec::new();
 	let mut p = 0;
 	while p + 3 <= buf.len() {
