@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use cri::acb::program::{
 	ActionEvent, ActionTarget, CueParam, CueSheet, NestedSequence, ProgramTrack, SequenceType,
 };
-use cri::acb::{Acb, AwbSource};
+use cri::acb::{Acb, AwbSource, Cue};
 use cri::acf::Acf;
 use cri::adx::AdxHeader;
 use cri::afs2::Afs2;
@@ -627,30 +627,35 @@ fn refuse(o: &Info, what: &str, waves: bool, graphs: bool) -> Result<()> {
 	}
 }
 
-fn acb_info(path: &Path, bytes: Vec<u8>, o: Info) -> Result<()> {
-	let full = o.full || o.graphs;
-	let all = !(o.cues || full || o.waves);
-	let acb = Acb::from_bytes(bytes)?;
-
-	// A number matches the cue with that ID; anything else, the cues whose names contain it.
-	let patterns: Vec<(Option<i64>, String)> =
-		o.patterns.iter().map(|p| (p.parse().ok(), p.to_lowercase())).collect();
+// The cues, with their indices, that any pattern matches, or every cue when there is none. A number
+// matches the cue with that ID; anything else, the cues whose names contain it, ignoring case.
+pub fn matching_cues(acb: &Acb, patterns: &[String]) -> Result<Vec<(usize, Cue)>> {
+	let parsed: Vec<(Option<i64>, String)> =
+		patterns.iter().map(|p| (p.parse().ok(), p.to_lowercase())).collect();
 	let cues: Vec<_> = acb
 		.cues()
 		.into_iter()
 		.enumerate()
 		.filter(|(_, c)| {
 			let name = c.name.to_lowercase();
-			patterns.is_empty()
-				|| patterns.iter().any(|(id, p)| match id {
+			parsed.is_empty()
+				|| parsed.iter().any(|(id, p)| match id {
 					Some(id) => c.id == *id,
 					None => name.contains(p.as_str()),
 				})
 		})
 		.collect();
-	if cues.is_empty() && !patterns.is_empty() {
-		bail!("no cue matches {}", o.patterns.join(", "));
+	if cues.is_empty() && !parsed.is_empty() {
+		bail!("no cue matches {}", patterns.join(", "));
 	}
+	Ok(cues)
+}
+
+fn acb_info(path: &Path, bytes: Vec<u8>, o: Info) -> Result<()> {
+	let full = o.full || o.graphs;
+	let all = !(o.cues || full || o.waves);
+	let acb = Acb::from_bytes(bytes)?;
+	let cues = matching_cues(&acb, &o.patterns)?;
 	if all {
 		println!("{}\n", summarize(path, acb.buffer().to_vec())?.join("\n  "));
 	}
@@ -659,7 +664,7 @@ fn acb_info(path: &Path, bytes: Vec<u8>, o: Info) -> Result<()> {
 	let streaming = load_awb(path, o.awb)?;
 	let waves = (all || o.waves)
 		.then(|| {
-			let only: Option<BTreeSet<usize>> = (!patterns.is_empty())
+			let only: Option<BTreeSet<usize>> = (!o.patterns.is_empty())
 				.then(|| cues.iter().flat_map(|(_, c)| c.waveforms.iter().copied()).collect());
 			wave_lines(&acb, streaming.as_deref(), only.as_ref())
 		})

@@ -24,9 +24,7 @@ Every fallible function returns `cri::Error`, which says which format the input 
 | `ls`      | the CRI files in a directory or among files, one line each               |
 | `info`    | what a file holds: cues, waveforms, archive entries, buses or streams    |
 | `utf`     | an ACB's or ACF's `@UTF` tables, their schemas and rows                  |
-| `decode`  | an HCA or ADX file to WAV                                                |
-| `extract` | every waveform of an ACB or AWB, to WAV or as stored                     |
-| `demux`   | a USM's video, audio and alpha streams                                   |
+| `extract` | audio and video out of a file, decoded to WAV or as stored               |
 
 Encrypted files need the keycode, given with `--key` or the `CRI_KEY` environment variable.
 

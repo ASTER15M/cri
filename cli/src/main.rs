@@ -77,54 +77,35 @@ enum Cmd {
 		#[arg(short, long, default_value_t = 20)]
 		limit: usize,
 	},
-	/// Decode HCA or ADX to WAV.
+	/// Extract audio and video.
 	///
-	/// Decode an HCA or ADX file to WAV.
-	Decode {
+	/// An ACB's or AWB's waveforms, decoded to WAV or as stored; a USM's video, alpha and audio
+	/// streams, its audio decoded unless --raw; or an HCA or ADX file, decoded to WAV.
+	Extract {
+		/// An ACB, whose files are named by the first cue that plays them, an AWB, a USM, or an HCA or
+		/// ADX file.
 		input: PathBuf,
-		/// The WAV to write; defaults to the input with a `.wav` extension.
+		/// Only the waveforms of the cues with one of these IDs or whose names contain one, ignoring
+		/// case. ACB only.
+		patterns: Vec<String>,
+		/// The directory to write into; created when missing. Defaults to a directory beside the
+		/// input, named after it, or for an HCA or ADX file, the input's own directory.
 		#[arg(short, long)]
 		out: Option<PathBuf>,
-		/// The AWB subkey the file was stored under, for keyed HCA and ADX type 9.
-		#[arg(long, default_value_t = 0)]
-		subkey: u16,
-		#[command(flatten)]
-		key: KeyArg,
-		#[command(flatten)]
-		format: FormatArg,
-	},
-	/// Extract an ACB's or AWB's waveforms.
-	///
-	/// Write every waveform of an ACB or AWB to a directory, decoded to WAV or as stored.
-	Extract {
-		/// An ACB, whose files are named by the first cue that plays them, or an AWB.
-		input: PathBuf,
-		/// The directory to write into; created when missing.
-		#[arg(short, long)]
-		out: PathBuf,
-		/// Write the HCA or ADX bitstreams as stored instead of decoding them.
+		/// Write the HCA and ADX bitstreams as stored instead of decoding them.
 		#[arg(long)]
 		raw: bool,
-		/// Only waveforms of cues whose name contains this, ignoring case. ACB only.
+		/// The AWB subkey a loose HCA or ADX file was stored under, for keyed HCA and ADX type 9.
 		#[arg(long)]
-		cue: Option<String>,
+		subkey: Option<u16>,
 		#[command(flatten)]
 		awb: AwbArg,
-		#[command(flatten)]
-		key: KeyArg,
-		#[command(flatten)]
-		format: FormatArg,
-	},
-	/// Split a USM into streams.
-	///
-	/// Split a USM into its video, audio and alpha streams.
-	Demux {
-		usm: PathBuf,
-		/// The directory to write into; created when missing.
-		#[arg(short, long)]
-		out: PathBuf,
-		#[command(flatten)]
-		key: KeyArg,
+		/// The keycode for encrypted HCA, ADX and USM, in decimal or `0x` hex.
+		#[arg(long, env = "CRI_KEY", value_parser = parse_key, hide_env_values = true)]
+		key: Option<u64>,
+		/// Write 16-bit PCM instead of 32-bit float.
+		#[arg(long)]
+		pcm16: bool,
 	},
 }
 
@@ -133,20 +114,6 @@ struct AwbArg {
 	/// The ACB's streaming AWB; defaults to the `.awb` beside it, when there is one.
 	#[arg(long)]
 	awb: Option<PathBuf>,
-}
-
-#[derive(clap::Args)]
-struct KeyArg {
-	/// The keycode for encrypted HCA, ADX and USM, in decimal or `0x` hex.
-	#[arg(long, env = "CRI_KEY", value_parser = parse_key, hide_env_values = true)]
-	key: Option<u64>,
-}
-
-#[derive(clap::Args)]
-struct FormatArg {
-	/// Write 16-bit PCM instead of 32-bit float.
-	#[arg(long)]
-	pcm16: bool,
 }
 
 fn parse_key(s: &str) -> Result<u64> {
@@ -175,14 +142,9 @@ fn main() -> Result<()> {
 		Cmd::Utf { file, table, schema, columns, row, limit } => {
 			explore::utf(&file, table.as_deref(), schema, &columns, row, limit)
 		}
-		Cmd::Decode { input, out, subkey, key, format } => {
-			let out = out.unwrap_or_else(|| input.with_extension("wav"));
-			write::decode(&input, &out, key.key, subkey, format.pcm16)
+		Cmd::Extract { input, patterns, out, raw, subkey, awb, key, pcm16 } => {
+			let o = write::Extract { patterns, out, raw, subkey, awb: awb.awb, keycode: key, pcm16 };
+			write::extract(&input, o)
 		}
-		Cmd::Extract { input, out, raw, cue, awb, key, format } => {
-			let opts = write::Extract { raw, cue, keycode: key.key, pcm16: format.pcm16 };
-			write::extract(&input, awb.awb, &out, &opts)
-		}
-		Cmd::Demux { usm, out, key } => write::demux(&usm, &out, key.key),
 	}
 }
