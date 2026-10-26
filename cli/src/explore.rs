@@ -64,10 +64,7 @@ pub fn describe(b: &[u8]) -> String {
 					h.total_samples() as f64 / f64::from(h.sample_rate.max(1)),
 					h.ciph_type
 				);
-				if let Some(l) = h.loop_info {
-					let at = |n: i64| n as f64 / f64::from(h.sample_rate.max(1));
-					s += &format!(", loop {:.3}..{:.3} s", at(l.start_sample(&h)), at(l.end_sample(&h)));
-				}
+				s += &loop_text(b);
 				s
 			}
 			Err(e) => format!("HCA, unreadable: {e}"),
@@ -82,10 +79,7 @@ pub fn describe(b: &[u8]) -> String {
 					f64::from(h.sample_count) / f64::from(h.sample_rate.max(1)),
 					h.encoding_type
 				);
-				if let Some(l) = h.loop_info {
-					let at = |n: u32| f64::from(n) / f64::from(h.sample_rate.max(1));
-					s += &format!(", loop {:.3}..{:.3} s", at(l.start_sample), at(l.end_sample));
-				}
+				s += &loop_text(b);
 				s
 			}
 			Err(e) => format!("ADX, unreadable: {e}"),
@@ -93,6 +87,23 @@ pub fn describe(b: &[u8]) -> String {
 		Kind::Unknown => format!("unknown, starts {}", hex(&b[..b.len().min(8)])),
 		kind => kind.to_string(),
 	}
+}
+
+// `, loop A..B s` from a bitstream's own header, or nothing when it does not loop. The ACB's
+// `LoopFlag` does not say whether a waveform loops; the header does.
+fn loop_text(b: &[u8]) -> String {
+	let secs = match sniff(b) {
+		Kind::Hca => HcaHeader::parse(b).ok().and_then(|h| {
+			let at = |n: i64| n as f64 / f64::from(h.sample_rate.max(1));
+			h.loop_info.map(|l| (at(l.start_sample(&h)), at(l.end_sample(&h))))
+		}),
+		Kind::Adx => AdxHeader::parse(b).ok().and_then(|h| {
+			let at = |n: u32| f64::from(n) / f64::from(h.sample_rate.max(1));
+			h.loop_info.map(|l| (at(l.start_sample), at(l.end_sample)))
+		}),
+		_ => None,
+	};
+	secs.map_or(String::new(), |(a, b)| format!(", loop {a:.3}..{b:.3} s"))
 }
 
 fn hex(b: &[u8]) -> String {
@@ -815,9 +826,9 @@ impl Scope<'_, '_> {
 					AwbSource::Internal => "embedded",
 					AwbSource::External => "streaming",
 				};
-				let missing = if l.data.is_some() { "" } else { ", archive not loaded" };
+				let tail = self.sheet.layer_bytes(l).map_or(", archive not loaded".into(), loop_text);
 				println!(
-					"{inner}+{:>6} ms  waveform[{}]{synth}: {} {}ch {} Hz {:.1} ms, {source} #{}{missing}",
+					"{inner}+{:>6} ms  waveform[{}]{synth}: {} {}ch {} Hz {:.1} ms, {source} #{}{tail}",
 					l.start_ms,
 					l.waveform,
 					codec_name(l.encode_type),
