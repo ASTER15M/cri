@@ -201,11 +201,12 @@ impl PassGrid {
 	}
 }
 
-// Interleaved, at its own rate
-struct Waveform {
-	pcm: Vec<f32>,
-	channels: usize,
-	rate: u32,
+// Interleaved, at its own rate. A layer plays only stereo at the mixer's rate.
+#[derive(Debug, Clone)]
+pub struct Waveform {
+	pub pcm: Vec<f32>,
+	pub channels: usize,
+	pub rate: u32,
 }
 
 // A layer's pitch in cents, and whether it was drawn
@@ -415,6 +416,7 @@ pub struct AsrMixer<'a> {
 	cfg: AsrConfig,
 	waveforms: HashMap<(usize, usize), Arc<Waveform>>,
 	programs: HashMap<(usize, Cue), Arc<CueProgram>>,
+	own_cues: usize, // given by `add_cue`, each a sheet after the ACBs'
 }
 
 impl<'a> AsrMixer<'a> {
@@ -423,7 +425,38 @@ impl<'a> AsrMixer<'a> {
 		let setting = (acf.dsp_setting(&acf.default_dsp_setting)).ok_or_else(|| {
 			Error::unrenderable(format!("the ACF has no DSP setting {}", acf.default_dsp_setting))
 		})?;
-		Ok(Self { sheets, acf, setting, cfg, waveforms: HashMap::new(), programs: HashMap::new() })
+		let (waveforms, programs) = (HashMap::new(), HashMap::new());
+		Ok(Self { sheets, acf, setting, cfg, waveforms, programs, own_cues: 0 })
+	}
+
+	// A cue of the caller's own, not in any ACB: `program`, its layers playing `waveforms` by
+	// `Layer::waveform`, whose lengths it takes. It plays as sheet `n` of a mixer whose ACB sheets
+	// and earlier own cues number `n`, by its ID or name, and carries nothing that needs a sheet.
+	pub fn add_cue(&mut self, mut program: CueProgram, waveforms: Vec<Waveform>) -> Result<usize> {
+		renderable(&program)?;
+		let refuse = |what: String| Err(Error::unrenderable(format!("cue {}: {what}", program.name)));
+		if program.tracks.iter().any(|t| !t.local_aisacs.is_empty()) {
+			return refuse("track AISACs, which need a sheet".into());
+		}
+		let layers = program.tracks.iter().flat_map(|t| &t.layers);
+		if let Some(l) = layers.clone().find(|l| l.waveform >= waveforms.len()) {
+			return refuse(format!("waveform[{}] of {}", l.waveform, waveforms.len()));
+		}
+		for layer in program.tracks.iter_mut().flat_map(|t| &mut t.layers) {
+			let w = &waveforms[layer.waveform];
+			layer.channels = w.channels as i64;
+			layer.sample_rate = i64::from(w.rate);
+			layer.num_samples = (w.pcm.len() / w.channels.max(1)) as i64;
+		}
+		let sheet = self.sheets.len() + self.own_cues;
+		self.own_cues += 1;
+		for (i, w) in waveforms.into_iter().enumerate() {
+			self.waveforms.insert((sheet, i), Arc::new(w));
+		}
+		let program = Arc::new(program);
+		self.programs.insert((sheet, Cue::Id(program.cue_id)), program.clone());
+		self.programs.insert((sheet, Cue::Name(program.name.clone())), program);
+		Ok(sheet)
 	}
 
 	pub fn with_dsp_setting(mut self, name: &str) -> Result<Self> {
@@ -638,7 +671,8 @@ impl<'a> AsrMixer<'a> {
 		if let Some(w) = self.waveforms.get(&(sheet, layer.waveform)) {
 			return Ok(w.clone());
 		}
-		let s = self.sheets[sheet];
+		let s = (self.sheets.get(sheet))
+			.ok_or_else(|| Error::unrenderable(format!("no cue sheet {sheet}")))?;
 		let bytes = (s.layer_bytes(layer))
 			.ok_or_else(|| Error::unrenderable(format!("waveform[{}] is not loaded", layer.waveform)))?;
 		let subkey = s.layer_subkey(layer);
