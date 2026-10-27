@@ -4,6 +4,7 @@
 // resampled as the library resamples it. What this renders other than CRI would is counted in
 // `Approximated`; a cue or a bus feature it cannot render at all fails the render.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -109,58 +110,92 @@ pub struct Mix {
 
 // The frame each audio pass begins. The rack refills the sink's queue to one pass's budget and
 // stops at a refused submit, so the sink's release quantum decides the starts, which are not
-// multiples of `frames_per_tick`.
-#[derive(Debug, Clone)]
+// multiples of `frames_per_tick`. It depends on the configuration alone, so it is simulated as far
+// as it is read.
+#[derive(Debug)]
 struct PassGrid {
-	starts: Vec<u64>,
-	production_starts: Vec<u64>, // each block of at most 256 frames; the graph runs once per block
 	frames_per_tick: u64,
 	rate: u64,
+	budget: u64,
+	released: u64, // capacity the sink releases each pass
+	simulation: RefCell<GridSimulation>,
+}
+
+#[derive(Debug, Default)]
+struct GridSimulation {
+	starts: Vec<u64>,            // of every pass simulated
+	production_starts: Vec<u64>, // each block of at most 256 frames; the graph runs once per block
+	rendered: u64,               // where the next pass starts
+	carried: u64,
+	capacity: u64,
 }
 
 impl PassGrid {
-	fn of(cfg: &AsrConfig, ticks: u64) -> Self {
-		Self::simulate(cfg, ticks, |_, _| {})
+	fn new(cfg: &AsrConfig) -> Self {
+		Self {
+			frames_per_tick: cfg.frames_per_tick(),
+			rate: u64::from(cfg.rate),
+			budget: cfg.frames_per_pass(),
+			released: cfg.frames_per_tick() * u64::from(cfg.release_quantum_ticks.max(1)),
+			simulation: RefCell::default(),
+		}
 	}
 
-	// The rack against the sink: it refills to one pass's budget in blocks of at most
-	// `PRODUCTION_CHUNK`, rounded up to `PRODUCTION_UNIT`, and stops at the first submit not taken
-	// whole. The overshoot carries into the next pass and shortens its budget.
-	fn simulate(cfg: &AsrConfig, ticks: u64, mut on_block: impl FnMut(usize, u32)) -> Self {
-		let per_tick = cfg.frames_per_tick();
-		let budget = cfg.frames_per_pass();
-		let mut starts = Vec::with_capacity(ticks as usize + 1);
-		let mut production_starts = Vec::with_capacity(ticks as usize * 2);
-		let (mut rendered, mut carried, mut capacity) = (0u64, 0u64, 0u64);
-		for pass in 0..ticks as usize {
-			starts.push(rendered);
-			capacity += per_tick * u64::from(cfg.release_quantum_ticks.max(1));
-			// The carried block goes first; it is at most one chunk, so a quantum takes it.
-			let taken = carried.min(capacity);
-			capacity -= taken;
-			let want = budget.saturating_sub(carried);
-			carried -= taken;
-			let mut produced = 0u64;
-			while produced < want {
-				let block = (want - produced).min(PRODUCTION_CHUNK).next_multiple_of(PRODUCTION_UNIT);
-				production_starts.push(rendered + produced);
-				on_block(pass, block as u32);
-				produced += block;
-				let accepted = block.min(capacity);
-				capacity -= accepted;
-				if accepted < block {
-					carried += block - accepted;
-					break;
-				}
+	// One more pass of the rack against the sink: it refills to one pass's budget in blocks of at
+	// most `PRODUCTION_CHUNK`, rounded up to `PRODUCTION_UNIT`, and stops at the first submit not
+	// taken whole. The overshoot carries into the next pass and shortens its budget.
+	fn simulate_pass(&self, sim: &mut GridSimulation) {
+		sim.starts.push(sim.rendered);
+		sim.capacity += self.released;
+		// The carried block goes first; it is at most one chunk, so a quantum takes it.
+		let taken = sim.carried.min(sim.capacity);
+		sim.capacity -= taken;
+		let want = self.budget.saturating_sub(sim.carried);
+		sim.carried -= taken;
+		let mut produced = 0u64;
+		while produced < want {
+			let block = (want - produced).min(PRODUCTION_CHUNK).next_multiple_of(PRODUCTION_UNIT);
+			sim.production_starts.push(sim.rendered + produced);
+			produced += block;
+			let accepted = block.min(sim.capacity);
+			sim.capacity -= accepted;
+			if accepted < block {
+				sim.carried += block - accepted;
+				break;
 			}
-			rendered += produced;
 		}
-		starts.push(rendered);
-		Self { starts, production_starts, frames_per_tick: per_tick, rate: u64::from(cfg.rate) }
+		sim.rendered += produced;
+	}
+
+	// Simulated through pass `pass` and past frame `frame`
+	fn simulation(&self, pass: usize, frame: u64) -> std::cell::Ref<'_, GridSimulation> {
+		{
+			let mut sim = self.simulation.borrow_mut();
+			while sim.starts.len() <= pass || sim.rendered <= frame {
+				self.simulate_pass(&mut sim);
+			}
+		}
+		self.simulation.borrow()
 	}
 
 	fn start(&self, pass: usize) -> u64 {
-		self.starts[pass.min(self.starts.len() - 1)]
+		self.simulation(pass, 0).starts[pass]
+	}
+
+	// Where production block `n` starts
+	fn block(&self, n: usize) -> u64 {
+		let mut sim = self.simulation.borrow_mut();
+		while sim.production_starts.len() <= n {
+			self.simulate_pass(&mut sim);
+		}
+		sim.production_starts[n]
+	}
+
+	// The production block starting at or after `frame`. Blocks follow each other with none longer
+	// than a chunk, so one starts within a chunk of it.
+	fn block_at_or_after(&self, frame: u64) -> u64 {
+		let sim = self.simulation(0, frame + PRODUCTION_CHUNK);
+		sim.production_starts[sim.production_starts.partition_point(|&b| b < frame)]
 	}
 
 	// How many frames a voice from `start` makes of `source` frames at `step`. The rack pulls each
@@ -174,19 +209,17 @@ impl PassGrid {
 		}
 		let lookahead = 8 * UNIT_STEP as u64;
 		let last_pull = (source * UNIT_STEP as u64).saturating_sub(lookahead).div_ceil(step as u64);
-		let from = start + last_pull.max(1);
-		let i = self.production_starts.partition_point(|&b| b < from);
-		self.production_starts.get(i).map_or(whole, |&end| whole.min(end - start))
-	}
-
-	fn passes(&self) -> usize {
-		self.starts.len() - 1
+		if last_pull >= whole {
+			return whole;
+		}
+		whole.min(self.block_at_or_after(start + last_pull.max(1)) - start)
 	}
 
 	fn production_pulse(&self, frame: u64) -> f32 {
-		if self.production_starts.binary_search(&frame).is_ok() {
+		let sim = self.simulation(0, frame);
+		if sim.production_starts.binary_search(&frame).is_ok() {
 			ASR_ANTI_DENORMAL
-		} else if frame > 0 && self.production_starts.binary_search(&(frame - 1)).is_ok() {
+		} else if frame > 0 && sim.production_starts.binary_search(&(frame - 1)).is_ok() {
 			-ASR_ANTI_DENORMAL
 		} else {
 			0.0
@@ -204,12 +237,8 @@ impl PassGrid {
 	}
 
 	fn pass_of(&self, frame: u64) -> usize {
-		let (mut lo, mut hi) = (0usize, self.passes());
-		while lo + 1 < hi {
-			let mid = (lo + hi) / 2;
-			if self.start(mid) <= frame { lo = mid } else { hi = mid }
-		}
-		lo
+		let sim = self.simulation(0, frame);
+		sim.starts.partition_point(|&s| s <= frame) - 1
 	}
 }
 
@@ -259,7 +288,7 @@ impl Playback {
 		}
 		let want = authored - start_time_ms;
 		let mut pass = self.onset_pass;
-		while pass < grid.passes() && (grid.cursor_us(pass) - self.origin_us).div_euclid(1000) < want {
+		while (grid.cursor_us(pass) - self.origin_us).div_euclid(1000) < want {
 			pass += 1;
 		}
 		(grid.start(pass).max(self.onset), 0)
@@ -477,183 +506,62 @@ impl<'a> AsrMixer<'a> {
 
 	// Replays `commands`, sorted by tick, over `ticks` ticks.
 	pub fn render(&mut self, commands: &[Command], ticks: u64) -> Result<Mix> {
-		let grid = PassGrid::of(&self.cfg, ticks + 2);
-		let playbacks = self.resolve(commands, &grid)?;
-		let mut graph = BusGraph::of(self.setting, self.cfg.rate)?;
-
+		let caches = (std::mem::take(&mut self.waveforms), std::mem::take(&mut self.programs));
+		let mixer =
+			AsrMixer { waveforms: caches.0, programs: caches.1, sheets: self.sheets.clone(), ..*self };
+		let mut stream = mixer.stream()?;
+		let pushed = commands.iter().try_for_each(|c| stream.push(c));
 		let frames = ticks * self.cfg.frames_per_tick();
-		let channels = self.cfg.channels;
-		let mut approximated = Approximated::default();
-		let mut voices = Vec::new();
-		let mut edges: Vec<(u64, i32)> = Vec::new(); // `(frame, ±1)` layer edges, for the peak count
-		for (i, playback) in playbacks.iter().enumerate() {
-			self.voices(i, playback, &grid, frames, &graph, &mut voices, &mut approximated)?;
+		let mut pcm = vec![0.0f32; frames as usize * self.cfg.channels];
+		if pushed.is_ok() {
+			stream.fill(&mut pcm);
 		}
-		let played: BTreeSet<u32> =
-			playbacks.iter().flat_map(|p| p.play.program.categories()).collect();
-		let index_played =
-			|index: usize| self.acf.categories.get(index).is_some_and(|c| played.contains(&c.id));
-		for r in &self.acf.reacts {
-			if index_played(r.source) && index_played(r.dest) {
-				let name = |i: usize| self.acf.categories.get(i).map_or("?", |c| c.name.as_str());
-				approximated.reacts.insert(format!("{} ducks {}", name(r.source), name(r.dest)));
-			}
-		}
-		for v in &voices {
-			edges.push((v.start, 1));
-			edges.push((v.last, -1));
-		}
-
-		let mut pcm = vec![0.0f32; frames as usize * channels];
-		let mut planes: Vec<Vec<f32>> =
-			vec![vec![0.0; PRODUCTION_CHUNK as usize * channels]; graph.buses.len()];
-		let mut live = vec![false; graph.buses.len()];
-		// Sounding voices, summed in play order
-		let mut by_start: Vec<usize> = (0..voices.len()).collect();
-		by_start.sort_by_key(|&v| voices[v].start);
-		let (mut next_start, mut active) = (0, BTreeSet::new());
-		let blocks =
-			grid.production_starts.iter().copied().take_while(|&b| b < frames).collect::<Vec<_>>();
-		for (n, &b0) in blocks.iter().enumerate() {
-			let b1 = blocks.get(n + 1).copied().unwrap_or(frames).min(frames);
-			let len = (b1 - b0) as usize;
-			for p in &mut planes {
-				p[..len * channels].fill(0.0);
-			}
-			live.fill(false);
-
-			while next_start < by_start.len() && voices[by_start[next_start]].start < b1 {
-				active.insert(by_start[next_start]);
-				next_start += 1;
-			}
-			active.retain(|&v| voices[v].last > b0);
-			for &v in &active {
-				let voice = &mut voices[v];
-				let playback = &playbacks[voice.playback];
-				render_voice(voice, playback, &grid, b0, b1, channels, &mut planes, &mut live);
-			}
-
-			for n in 0..graph.order.len() {
-				let i = graph.order[n];
-				run_bus(&mut graph, i, len, channels, &mut planes, &mut live, &mut approximated);
-			}
-			let out = &mut pcm[b0 as usize * channels..b1 as usize * channels];
-			out.copy_from_slice(&planes[graph.root][..len * channels]);
-		}
-
-		edges.sort_unstable();
-		let (mut now, mut peak) = (0i32, 0i32);
-		for (_, delta) in &edges {
-			now += delta;
-			peak = peak.max(now);
-		}
-
-		Ok(Mix {
+		let mix = Mix {
 			pcm,
-			channels,
+			channels: self.cfg.channels,
 			frames,
-			approximated,
-			playbacks: playbacks.len(),
-			peak_concurrent_layers: peak as usize,
-		})
+			approximated: stream.approximated.clone(),
+			playbacks: stream.playbacks.len(),
+			peak_concurrent_layers: stream.peak_concurrent_layers(frames),
+		};
+		let mixer = stream.into_mixer();
+		(self.waveforms, self.programs) = (mixer.waveforms, mixer.programs);
+		pushed.map(|()| mix)
 	}
 
-	fn resolve(&mut self, commands: &[Command], grid: &PassGrid) -> Result<Vec<Playback>> {
-		// A player keeps its AISAC controls, as nothing clears them.
-		struct Slot {
-			controls: BTreeMap<u32, f32>,
-			active: Option<usize>,
-			held: Option<PlayState>,
-			// The frame the player is free from. A play while it still holds a playback sounds a
-			// pass early, overlapping the outgoing one's release.
-			occupied_until: Option<u64>,
-			rng: [u32; 4],
-		}
+	// The mixer as a stream, from tick 0
+	pub fn stream(self) -> Result<AsrStream<'a>> {
+		let graph = BusGraph::of(self.setting, self.cfg.rate)?;
 		let mut global = seeded(self.cfg.seed);
-		let mut slots: Vec<Slot> = (0..self.cfg.players)
+		let slots = (0..self.cfg.players)
 			.map(|_| {
 				let rng = seeded(next(&mut global) % 0x8000_0000);
 				next(&mut global); // the second generator, which no pitch draws from
 				Slot { controls: BTreeMap::new(), active: None, held: None, occupied_until: None, rng }
 			})
 			.collect();
-		let mut playbacks: Vec<Playback> = Vec::new();
-		let rate = self.cfg.rate as i64;
-		let held = self.cfg.player_held_frames();
-
-		for command in commands {
-			let players = slots.len();
-			let fail =
-				|reason: String| Error::Command { tick: command.tick, player: command.player, reason };
-			let slot =
-				(slots.get_mut(command.player)).ok_or_else(|| fail(format!("{players} players")))?;
-			let issued_at = grid.start(command.tick as usize);
-			match &command.op {
-				Op::Play(play) => {
-					// The game stops a player before every play on it.
-					if slot.active.is_some() || slot.held.is_some() {
-						return Err(fail("the player is already playing".into()));
-					}
-					let program = self.program(play.sheet, &play.cue)?;
-					let pitches = draw_pitches(&program, &mut slot.rng);
-					let state = PlayState {
-						sheet: play.sheet,
-						program,
-						pitches,
-						start_time_ms: play.start_time_ms,
-						controls: slot.controls.clone(),
-					};
-					if play.prepare {
-						slot.held = Some(state);
-						continue;
-					}
-					let occupied = slot.occupied_until.is_some_and(|f| issued_at < f);
-					let onset_pass = command.tick as usize + usize::from(!occupied);
-					slot.active = Some(playbacks.len());
-					let playback = Playback {
-						play: state,
-						onset_pass,
-						onset: grid.start(onset_pass),
-						origin_us: grid.clock_after(command.tick as usize),
-						release: None,
-					};
-					slot.occupied_until = Some(playback.natural_end(grid, rate) + held);
-					playbacks.push(playback);
-				}
-				Op::Pause(false) => {
-					// The release sounds where its own tick's pass begins. How a held cue's later
-					// layers and AISACs run is unread; a music cue has neither.
-					let Some(state) = slot.held.take() else { continue };
-					let onset_pass = command.tick as usize;
-					slot.active = Some(playbacks.len());
-					let playback = Playback {
-						play: state,
-						onset_pass,
-						onset: grid.start(onset_pass),
-						origin_us: grid.clock_after(onset_pass),
-						release: None,
-					};
-					slot.occupied_until = Some(playback.natural_end(grid, rate) + held);
-					playbacks.push(playback);
-				}
-				Op::Pause(true) => return Err(fail("pausing a sounding play is not modeled".into())),
-				Op::Aisac { control_id, value } => {
-					slot.controls.insert(*control_id, *value);
-				}
-				Op::Stop => {
-					slot.held = None;
-					if let Some(i) = slot.active.take() {
-						playbacks[i].release = Some(issued_at);
-						let end = playbacks[i]
-							.natural_end(grid, rate)
-							.min(issued_at + PRODUCTION_CHUNK)
-							.max(playbacks[i].onset);
-						slot.occupied_until = Some(end + held);
-					}
-				}
-			}
-		}
-		Ok(playbacks)
+		let planes = vec![vec![0.0; PRODUCTION_CHUNK as usize * self.cfg.channels]; graph.buses.len()];
+		Ok(AsrStream {
+			grid: PassGrid::new(&self.cfg),
+			live: vec![false; graph.buses.len()],
+			planes,
+			graph,
+			slots,
+			playbacks: Vec::new(),
+			layers: Vec::new(),
+			voices: Vec::new(),
+			waiting: BTreeSet::new(),
+			sounding: BTreeSet::new(),
+			spans: Vec::new(),
+			block: 0,
+			rendered: Vec::new(),
+			handed: 0,
+			frames: 0,
+			last_tick: 0,
+			played: BTreeSet::new(),
+			approximated: Approximated::default(),
+			mixer: self,
+		})
 	}
 
 	fn program(&mut self, sheet: usize, cue: &Cue) -> Result<Arc<CueProgram>> {
@@ -709,7 +617,6 @@ impl<'a> AsrMixer<'a> {
 		index: usize,
 		playback: &Playback,
 		grid: &PassGrid,
-		total_frames: u64,
 		graph: &BusGraph,
 		out: &mut Vec<Voice>,
 		approximated: &mut Approximated,
@@ -761,7 +668,7 @@ impl<'a> AsrMixer<'a> {
 				if playback.release.is_some_and(|r| start >= r) {
 					continue;
 				}
-				let end = playback.release.map_or(u64::MAX, |r| r + PRODUCTION_CHUNK).min(total_frames);
+				let end = playback.release.map_or(u64::MAX, |r| r + PRODUCTION_CHUNK);
 				if start >= end {
 					continue;
 				}
@@ -884,6 +791,266 @@ impl<'a> AsrMixer<'a> {
 	}
 }
 
+// A player, as the stream keeps it. It keeps its AISAC controls, as nothing clears them.
+struct Slot {
+	controls: BTreeMap<u32, f32>,
+	active: Option<usize>,
+	held: Option<PlayState>,
+	// The frame the player is free from. A play while it still holds a playback sounds a pass early,
+	// overlapping the outgoing one's release.
+	occupied_until: Option<u64>,
+	rng: [u32; 4],
+}
+
+// The mixer as a stream: commands go in no earlier than the pass that renders next, and frames come
+// out as they are asked for. No command reaches back before its own tick's pass, so a voice is laid
+// out when its play arrives, and a later stop only shortens it or drops it before it starts.
+// `AsrMixer::render` is this with every command pushed first.
+pub struct AsrStream<'a> {
+	mixer: AsrMixer<'a>,
+	grid: PassGrid,
+	graph: BusGraph,
+	slots: Vec<Slot>,
+	playbacks: Vec<Playback>,
+	layers: Vec<std::ops::Range<usize>>, // each playback's voices
+	// Every voice in play order, which is the order they are summed in; `None` once it has ended or
+	// a stop came before it started
+	voices: Vec<Option<Voice>>,
+	waiting: BTreeSet<(u64, usize)>, // voices yet to start, by their first frame
+	sounding: BTreeSet<usize>,
+	spans: Vec<(u64, u64)>, // the frames of every voice that has ended
+	planes: Vec<Vec<f32>>,
+	live: Vec<bool>,
+	block: usize,       // the next production block
+	rendered: Vec<f32>, // the last block, interleaved
+	handed: usize,      // how much of it has been handed out
+	frames: u64,        // handed out in all
+	last_tick: u64,
+	played: BTreeSet<u32>, // every category a play was in
+	approximated: Approximated,
+}
+
+impl<'a> AsrStream<'a> {
+	pub fn config(&self) -> AsrConfig {
+		self.mixer.cfg
+	}
+
+	// `AsrMixer::add_cue`, for a cue added while the stream runs
+	pub fn add_cue(&mut self, program: CueProgram, waveforms: Vec<Waveform>) -> Result<usize> {
+		self.mixer.add_cue(program, waveforms)
+	}
+
+	// The earliest tick a command can still be pushed for: a pass is under way once its first block
+	// is rendered.
+	pub fn next_tick(&self) -> u64 {
+		match self.block {
+			0 => 0,
+			n => self.grid.pass_of(self.grid.block(n - 1)) as u64 + 1,
+		}
+	}
+
+	// Frames handed out so far
+	pub fn frames(&self) -> u64 {
+		self.frames
+	}
+
+	pub fn approximated(&self) -> &Approximated {
+		&self.approximated
+	}
+
+	pub fn into_mixer(self) -> AsrMixer<'a> {
+		self.mixer
+	}
+
+	// One command, on a tick no earlier than `next_tick` or the last command's
+	pub fn push(&mut self, command: &Command) -> Result<()> {
+		let fail =
+			|reason: String| Error::Command { tick: command.tick, player: command.player, reason };
+		if command.tick < self.next_tick() {
+			return Err(fail(format!("tick {} is already rendering", self.next_tick() - 1)));
+		}
+		if command.tick < self.last_tick {
+			return Err(fail(format!("it comes after a command on tick {}", self.last_tick)));
+		}
+		self.last_tick = command.tick;
+		let players = self.slots.len();
+		let rate = self.mixer.cfg.rate as i64;
+		let held = self.mixer.cfg.player_held_frames();
+		let grid = &self.grid;
+		let slot =
+			(self.slots.get_mut(command.player)).ok_or_else(|| fail(format!("{players} players")))?;
+		let issued_at = grid.start(command.tick as usize);
+		let playback = match &command.op {
+			Op::Play(play) => {
+				// The game stops a player before every play on it.
+				if slot.active.is_some() || slot.held.is_some() {
+					return Err(fail("the player is already playing".into()));
+				}
+				let program = self.mixer.program(play.sheet, &play.cue)?;
+				let pitches = draw_pitches(&program, &mut slot.rng);
+				let state = PlayState {
+					sheet: play.sheet,
+					program,
+					pitches,
+					start_time_ms: play.start_time_ms,
+					controls: slot.controls.clone(),
+				};
+				if play.prepare {
+					slot.held = Some(state);
+					return Ok(());
+				}
+				let occupied = slot.occupied_until.is_some_and(|f| issued_at < f);
+				let onset_pass = command.tick as usize + usize::from(!occupied);
+				Playback {
+					play: state,
+					onset_pass,
+					onset: grid.start(onset_pass),
+					origin_us: grid.clock_after(command.tick as usize),
+					release: None,
+				}
+			}
+			Op::Pause(false) => {
+				// The release sounds where its own tick's pass begins. How a held cue's later layers
+				// and AISACs run is unread; a music cue has neither.
+				let Some(state) = slot.held.take() else { return Ok(()) };
+				let onset_pass = command.tick as usize;
+				Playback {
+					play: state,
+					onset_pass,
+					onset: grid.start(onset_pass),
+					origin_us: grid.clock_after(onset_pass),
+					release: None,
+				}
+			}
+			Op::Pause(true) => return Err(fail("pausing a sounding play is not modeled".into())),
+			Op::Aisac { control_id, value } => {
+				slot.controls.insert(*control_id, *value);
+				return Ok(());
+			}
+			Op::Stop => {
+				slot.held = None;
+				let Some(i) = slot.active.take() else { return Ok(()) };
+				let playback = &mut self.playbacks[i];
+				playback.release = Some(issued_at);
+				let end =
+					playback.natural_end(grid, rate).min(issued_at + PRODUCTION_CHUNK).max(playback.onset);
+				slot.occupied_until = Some(end + held);
+				// A note-on due at or after the pass a stop lands in never happens.
+				for v in self.layers[i].clone() {
+					let Some(voice) = &mut self.voices[v] else { continue };
+					if voice.start >= issued_at {
+						self.waiting.remove(&(voice.start, v));
+						self.voices[v] = None;
+					} else {
+						voice.last = voice.last.min(issued_at + PRODUCTION_CHUNK);
+					}
+				}
+				return Ok(());
+			}
+		};
+		let index = self.playbacks.len();
+		slot.active = Some(index);
+		slot.occupied_until = Some(playback.natural_end(grid, rate) + held);
+
+		let mut voices = Vec::new();
+		self.mixer.voices(index, &playback, grid, &self.graph, &mut voices, &mut self.approximated)?;
+		let first = self.voices.len();
+		for voice in voices {
+			self.waiting.insert((voice.start, self.voices.len()));
+			self.voices.push(Some(voice));
+		}
+		self.layers.push(first..self.voices.len());
+		self.played.extend(playback.play.program.categories());
+		let acf = self.mixer.acf;
+		let index_played =
+			|i: usize| acf.categories.get(i).is_some_and(|c| self.played.contains(&c.id));
+		for r in &acf.reacts {
+			if index_played(r.source) && index_played(r.dest) {
+				let name = |i: usize| acf.categories.get(i).map_or("?", |c| c.name.as_str());
+				self.approximated.reacts.insert(format!("{} ducks {}", name(r.source), name(r.dest)));
+			}
+		}
+		self.playbacks.push(playback);
+		Ok(())
+	}
+
+	// The next `out.len() / channels` frames, interleaved
+	pub fn fill(&mut self, out: &mut [f32]) {
+		let mut done = 0;
+		while done < out.len() {
+			if self.handed == self.rendered.len() {
+				self.render_block();
+			}
+			let n = (self.rendered.len() - self.handed).min(out.len() - done);
+			out[done..done + n].copy_from_slice(&self.rendered[self.handed..self.handed + n]);
+			self.handed += n;
+			done += n;
+		}
+		self.frames += (out.len() / self.mixer.cfg.channels) as u64;
+	}
+
+	fn render_block(&mut self) {
+		let channels = self.mixer.cfg.channels;
+		let (b0, b1) = (self.grid.block(self.block), self.grid.block(self.block + 1));
+		self.block += 1;
+		let len = (b1 - b0) as usize;
+		for p in &mut self.planes {
+			p[..len * channels].fill(0.0);
+		}
+		self.live.fill(false);
+
+		while let Some(&(start, v)) = self.waiting.first()
+			&& start < b1
+		{
+			self.waiting.pop_first();
+			self.sounding.insert(v);
+		}
+		let voices = &mut self.voices;
+		let spans = &mut self.spans;
+		self.sounding.retain(|&v| {
+			let voice = voices[v].as_ref().expect("a sounding voice");
+			if voice.last > b0 {
+				return true;
+			}
+			spans.push((voice.start, voice.last));
+			voices[v] = None;
+			false
+		});
+		for &v in &self.sounding {
+			let voice = voices[v].as_mut().expect("a sounding voice");
+			let playback = &self.playbacks[voice.playback];
+			render_voice(voice, playback, &self.grid, b0, b1, channels, &mut self.planes, &mut self.live);
+		}
+
+		for n in 0..self.graph.order.len() {
+			let i = self.graph.order[n];
+			let (graph, planes, live) = (&mut self.graph, &mut self.planes, &mut self.live);
+			run_bus(graph, i, len, channels, planes, live, &mut self.approximated);
+		}
+		self.rendered.clear();
+		self.rendered.extend_from_slice(&self.planes[self.graph.root][..len * channels]);
+		self.handed = 0;
+	}
+
+	// The most layers sounding at once in the first `frames` frames
+	fn peak_concurrent_layers(&self, frames: u64) -> usize {
+		let open = self.voices.iter().flatten().map(|v| (v.start, v.last));
+		let spans = self.spans.iter().copied().chain(open).filter(|&(start, _)| start < frames);
+		let mut edges: Vec<(u64, i32)> = Vec::new();
+		for (start, last) in spans {
+			edges.push((start, 1));
+			edges.push((last.min(frames), -1));
+		}
+		edges.sort_unstable();
+		let (mut now, mut peak) = (0i32, 0i32);
+		for (_, delta) in &edges {
+			now += delta;
+			peak = peak.max(now);
+		}
+		peak as usize
+	}
+}
+
 // What the mixer refuses: anything a program carries that it would otherwise ignore
 fn renderable(program: &CueProgram) -> Result<()> {
 	let refuse = |what: String| Err(Error::unrenderable(format!("cue {}: {what}", program.name)));
@@ -958,7 +1125,7 @@ fn render_voice(
 	let to = voice.last.min(b1);
 	let source_frames = voice.waveform.pcm.len() / 2;
 	for frame in from..to {
-		while frame >= voice.pass_end && voice.pass + 1 < grid.passes() {
+		while frame >= voice.pass_end {
 			voice.pass += 1;
 			voice.pass_end = grid.start(voice.pass + 1);
 			voice.previous = voice.target;
@@ -1266,9 +1433,16 @@ mod tests {
 		}
 	}
 
+	// Each pass's production blocks, by length
 	fn blocks_of(cfg: &AsrConfig, passes: usize) -> Vec<Vec<u32>> {
+		let grid = PassGrid::new(cfg);
 		let mut blocks = vec![Vec::new(); passes];
-		PassGrid::simulate(cfg, passes as u64, |pass, frames| blocks[pass].push(frames));
+		let mut n = 0;
+		while grid.block(n) < grid.start(passes) {
+			let pass = grid.pass_of(grid.block(n));
+			blocks[pass].push((grid.block(n + 1) - grid.block(n)) as u32);
+			n += 1;
+		}
 		blocks
 	}
 
@@ -1278,7 +1452,7 @@ mod tests {
 		assert_eq!(cfg.frames_per_tick(), 400);
 		assert_eq!(cfg.frames_per_pass(), 448);
 
-		let grid = PassGrid::of(&cfg, 20);
+		let grid = PassGrid::new(&cfg);
 		let starts = [
 			0, 448, 864, 1248, 1664, 2048, 2464, 2848, 3264, 3648, 4064, 4448, 4864, 5248, 5664, 6048,
 			6464, 6848, 7264, 7648, 8064,
@@ -1288,7 +1462,8 @@ mod tests {
 			blocks_of(&cfg, 4),
 			[vec![256, 192], vec![256, 160], vec![256, 128], vec![256, 160]]
 		);
-		assert_eq!(&grid.production_starts[..8], [0, 256, 448, 704, 864, 1120, 1248, 1504]);
+		let blocks = (0..8).map(|n| grid.block(n)).collect::<Vec<_>>();
+		assert_eq!(blocks, [0, 256, 448, 704, 864, 1120, 1248, 1504]);
 		assert_eq!(grid.pass_of(447), 0);
 		assert_eq!(grid.pass_of(448), 1);
 	}
@@ -1299,7 +1474,7 @@ mod tests {
 		let cfg = AsrConfig { server_frequency: 60, ..cfg() };
 		assert_eq!(cfg.frames_per_tick(), 800);
 		assert_eq!(cfg.frames_per_pass(), 864);
-		let grid = PassGrid::of(&cfg, 40);
+		let grid = PassGrid::new(&cfg);
 		for p in 1..=40u64 {
 			let lead = if p % 2 == 1 { 64 } else { 32 };
 			assert_eq!(grid.start(p as usize), p * 800 + lead, "pass {p}");
@@ -1313,7 +1488,7 @@ mod tests {
 	// Rounding would put the 166,666 µs pass at 167 ms.
 	#[test]
 	fn master_clock() {
-		let grid = PassGrid::of(&cfg(), 32);
+		let grid = PassGrid::new(&cfg());
 		assert_eq!(grid.clock_after(20), 166_666);
 		assert_eq!(grid.clock_after(7), 58_333);
 		assert_eq!(grid.cursor_us(23).div_euclid(1000), 200);
@@ -1384,6 +1559,13 @@ mod tests {
 		}
 	}
 
+	// A live player renders on the audio device's thread.
+	#[test]
+	fn a_stream_can_move_to_another_thread() {
+		fn send<T: Send>() {}
+		send::<AsrStream<'static>>();
+	}
+
 	#[test]
 	fn steps() {
 		assert_eq!(step(48_000, 48_000, None), UNIT_STEP);
@@ -1414,7 +1596,7 @@ mod tests {
 
 	#[test]
 	fn a_resampling_voice_ends_with_its_last_pull() {
-		let grid = PassGrid::of(&cfg(), 40);
+		let grid = PassGrid::new(&cfg());
 		// 1060 frames at 1.5 could make 706, but the pull whose 8-frame lookahead reaches the last
 		// source frame is the block ending at 704, and the voice ends with it.
 		assert_eq!(resampled_frames(1060, 6144), 706);

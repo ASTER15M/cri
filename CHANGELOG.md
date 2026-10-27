@@ -12,6 +12,10 @@ is a breaking change and a patch bump (0.1.0 → 0.1.1) is not.
   in 1/4096ths of a frame against the output rate and interpolates linearly between the two frames
   around each step. A resampling voice ends with the production block whose pull takes its last
   source frame. Layers at another sample rate were dropped before.
+- `asr::AsrStream` is the mixer as a stream, for a live player: `AsrMixer::stream` starts one,
+  `push` takes each command no earlier than `next_tick`, and `fill` hands out the next frames,
+  rendering whole production blocks as it needs them. `AsrMixer::render` is now a stream with every
+  command pushed first, and renders the same samples as before.
 
 ## 0.2.1
 
