@@ -3,7 +3,7 @@
 Every release is tagged `v<version>`. Versions follow semver; before 1.0, a minor bump (0.1 → 0.2)
 is a breaking change and a patch bump (0.1.0 → 0.1.1) is not.
 
-## Unreleased
+## 0.3.0
 
 - **Breaking:** `asr::Approximated` no longer has `pitched_plays`, `random_pitch_plays` or
   `off_rate_layers`: none of them is an approximation any more.
