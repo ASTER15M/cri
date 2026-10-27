@@ -3,6 +3,16 @@
 Every release is tagged `v<version>`. Versions follow semver; before 1.0, a minor bump (0.1 → 0.2)
 is a breaking change and a patch bump (0.1.0 → 0.1.1) is not.
 
+## Unreleased
+
+- **Breaking:** `asr::Approximated` no longer has `pitched_plays`, `random_pitch_plays` or
+  `off_rate_layers`: none of them is an approximation any more.
+- `asr` resamples a voice at a pitch or at another sample rate as the library does. Its frequency is
+  the waveform's rate times `2^(cents/1200)`, truncated to whole hertz; it steps through the source
+  in 1/4096ths of a frame against the output rate and interpolates linearly between the two frames
+  around each step. A resampling voice ends with the production block whose pull takes its last
+  source frame. Layers at another sample rate were dropped before.
+
 ## 0.2.1
 
 - `asr::AsrMixer::add_cue` plays a cue of the caller's own: a `CueProgram` built in code, its layers

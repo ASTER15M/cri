@@ -1,7 +1,8 @@
 // The Atom sound renderer's float output, reproduced offline: sound commands in, planes out, on the
 // pass grid the native mixer renders on. Voices mix into the buses of an ACF's DSP setting, which
-// run in graph order once per production block. What this renders other than CRI would is counted
-// in `Approximated`; a cue or a bus feature it cannot render at all fails the render.
+// run in graph order once per production block. A voice at a pitch or at another sample rate is
+// resampled as the library resamples it. What this renders other than CRI would is counted in
+// `Approximated`; a cue or a bus feature it cannot render at all fails the render.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -80,11 +81,6 @@ pub enum Cue {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Approximated {
 	pub cues: BTreeSet<String>,
-	// Layers at a fixed or a drawn pitch: they are resampled linearly, and CRI's resampler is
-	// unread.
-	pub pitched_plays: usize,
-	pub random_pitch_plays: usize,
-	pub off_rate_layers: usize, // not resampled, so not rendered
 	pub non_stereo_layers: usize,
 	// Effects run as a pass-through: anything but `Matrix`, and an `Echo` that was fed. Their tails
 	// other than `Echo`'s are not modeled either.
@@ -167,6 +163,22 @@ impl PassGrid {
 		self.starts[pass.min(self.starts.len() - 1)]
 	}
 
+	// How many frames a voice from `start` makes of `source` frames at `step`. The rack pulls each
+	// voice once per block, and a resampling pull takes 8 source frames past what its output needs.
+	// The pull that takes the last one ends the voice at its block's end, though the frames it holds
+	// back could still make output.
+	fn voice_frames(&self, start: u64, source: u64, step: u32) -> u64 {
+		let whole = resampled_frames(source, step);
+		if step == UNIT_STEP {
+			return whole;
+		}
+		let lookahead = 8 * UNIT_STEP as u64;
+		let last_pull = (source * UNIT_STEP as u64).saturating_sub(lookahead).div_ceil(step as u64);
+		let from = start + last_pull.max(1);
+		let i = self.production_starts.partition_point(|&b| b < from);
+		self.production_starts.get(i).map_or(whole, |&end| whole.min(end - start))
+	}
+
 	fn passes(&self) -> usize {
 		self.starts.len() - 1
 	}
@@ -209,19 +221,12 @@ pub struct Waveform {
 	pub rate: u32,
 }
 
-// A layer's pitch in cents, and whether it was drawn
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Pitch {
-	cents: f32,
-	random: bool,
-}
-
 // What a play is, before and after its prepare is released
 #[derive(Clone)]
 struct PlayState {
 	sheet: usize,
 	program: Arc<CueProgram>,
-	pitches: Vec<Vec<Option<Pitch>>>, // per track, per layer
+	pitches: Vec<Vec<Option<f32>>>, // in cents, per track, per layer
 	start_time_ms: i64,
 	controls: BTreeMap<u32, f32>, // the player's AISAC controls when it played
 }
@@ -263,11 +268,12 @@ impl Playback {
 	// Past the last sample if nothing stops it
 	fn natural_end(&self, grid: &PassGrid, rate: i64) -> u64 {
 		let mut end = self.onset;
-		for track in &self.play.program.tracks {
-			for layer in &track.layers {
+		for (t, track) in self.play.program.tracks.iter().enumerate() {
+			for (l, layer) in track.layers.iter().enumerate() {
 				let (start, skip) = self.place(grid, layer.start_ms, rate);
-				let samples = (layer.num_samples.max(0) as usize).saturating_sub(skip) as u64;
-				end = end.max(start + samples);
+				let source = (layer.num_samples.max(0) as u64).saturating_sub(skip as u64);
+				let step = step(layer.sample_rate as u32, rate as u32, self.play.pitches[t][l]);
+				end = end.max(start + grid.voice_frames(start, source, step));
 			}
 		}
 		end
@@ -282,7 +288,7 @@ impl Playback {
 struct Voice {
 	playback: usize,
 	waveform: Arc<Waveform>,
-	ratio: f64,
+	step: u32, // source frames per output frame, in 1/4096ths
 	start: u64,
 	last: u64,
 	skip: usize,
@@ -735,26 +741,8 @@ impl<'a> AsrMixer<'a> {
 				let synth_volume = volume_of(&layer.params).unwrap_or(1.0);
 				let gain = sequence_volume * track_volume * synth_volume;
 
-				let ratio = match playback.play.pitches[t][l] {
-					Some(Pitch { cents, random }) if cents != 0.0 || random => {
-						if random {
-							approximated.random_pitch_plays += 1;
-							approximated.cues.insert(format!("{} (random pitch)", program.name));
-						} else {
-							approximated.pitched_plays += 1;
-							approximated.cues.insert(format!("{} (pitch {cents} cents)", program.name));
-						}
-						2f64.powf(cents as f64 / 1200.0)
-					}
-					_ => 1.0,
-				};
-
 				let waveform = self.waveform(sheet, layer)?;
-				if waveform.rate != self.cfg.rate {
-					approximated.off_rate_layers += 1;
-					approximated.cues.insert(format!("{} ({} Hz)", program.name, waveform.rate));
-					continue;
-				}
+				let step = step(waveform.rate, self.cfg.rate, playback.play.pitches[t][l]);
 				if waveform.channels != 2 {
 					approximated.non_stereo_layers += 1;
 					approximated.cues.insert(format!("{} ({} ch)", program.name, waveform.channels));
@@ -768,7 +756,7 @@ impl<'a> AsrMixer<'a> {
 				if skip >= source_frames {
 					continue;
 				}
-				let available = ((source_frames - skip) as f64 / ratio).floor() as u64;
+				let available = grid.voice_frames(start, (source_frames - skip) as u64, step);
 				// A note-on due at or after the pass a stop lands in never happens.
 				if playback.release.is_some_and(|r| start >= r) {
 					continue;
@@ -793,7 +781,7 @@ impl<'a> AsrMixer<'a> {
 				out.push(Voice {
 					playback: index,
 					waveform,
-					ratio,
+					step,
 					start,
 					last: (start + available).min(end),
 					skip,
@@ -986,7 +974,7 @@ fn render_voice(
 		}
 
 		let (mut l, mut r) =
-			sample(&voice.waveform.pcm, source_frames, voice.ratio, frame - voice.start, voice.skip);
+			sample(&voice.waveform.pcm, source_frames, voice.step, frame - voice.start, voice.skip);
 		// The voice's own pulse lands on its decoded planes, before its send gains.
 		let pulse = grid.production_pulse(frame);
 		l += pulse;
@@ -1128,30 +1116,51 @@ fn crossfade(previous: f32, target: f32, into: u64) -> f32 {
 	previous + (target - previous) * into as f32 / PRODUCTION_CHUNK as f32
 }
 
-// The source pair for output frame `offset`: a lookup at `ratio == 1.0`, else linear.
-fn sample(pcm: &[f32], source_frames: usize, ratio: f64, offset: u64, skip: usize) -> (f32, f32) {
-	if ratio == 1.0 {
+// A voice's step: its frequency, the waveform's rate times `2^(cents/1200)` in binary32 and
+// truncated to whole hertz, at most 8 times the output rate, as a 20.12 fixed-point ratio to it. A
+// voice at the output's rate and no pitch steps by exactly 1.
+fn step(rate: u32, output_rate: u32, cents: Option<f32>) -> u32 {
+	let ratio = cents.map_or(1.0, |c| 2f32.powf(c * 0.000_833_333_35));
+	let frequency = ((rate as f32 * ratio) as i32).max(1) as i64;
+	let output_rate = (output_rate as i64).max(1);
+	((frequency.min(8 * output_rate) << 12) / output_rate).max(1) as u32
+}
+
+const UNIT_STEP: u32 = 4096;
+
+// How many output frames a voice makes of `source` frames. Each one interpolates toward the next
+// source frame, so a voice stepping slower than 1 stops `4096 / step` frames short.
+fn resampled_frames(source: u64, step: u32) -> u64 {
+	if step == UNIT_STEP {
+		return source;
+	}
+	let short = if step < UNIT_STEP { (UNIT_STEP / step) as u64 } else { 0 };
+	(source * UNIT_STEP as u64 / step as u64).saturating_sub(short)
+}
+
+// The source pair for output frame `offset`: a lookup at a unit step, else the line between the
+// two source frames around `offset · step`, at its fraction in 1/4096ths.
+fn sample(pcm: &[f32], source_frames: usize, step: u32, offset: u64, skip: usize) -> (f32, f32) {
+	if step == UNIT_STEP {
 		let i = skip + offset as usize;
 		return (pcm[i * 2], pcm[i * 2 + 1]);
 	}
-	let pos = offset as f64 * ratio;
-	let a = (skip + pos.floor() as usize).min(source_frames - 1);
+	let position = offset * step as u64;
+	let a = (skip + (position >> 12) as usize).min(source_frames - 1);
 	let b = (a + 1).min(source_frames - 1);
-	let t = (pos - pos.floor()) as f32;
-	(
-		pcm[a * 2] + (pcm[b * 2] - pcm[a * 2]) * t,
-		pcm[a * 2 + 1] + (pcm[b * 2 + 1] - pcm[a * 2 + 1]) * t,
-	)
+	let t = (position & 0xfff) as f32 * (1.0 / 4096.0);
+	let lerp = |c: usize| (pcm[b * 2 + c] - pcm[a * 2 + c]) * t + pcm[a * 2 + c];
+	(lerp(0), lerp(1))
 }
 
 // Each layer's pitch, the innermost scope's. A random scope draws from the player's generator
 // once: the sequence's for the whole cue, then each track's in track order.
-fn draw_pitches(program: &CueProgram, rng: &mut [u32; 4]) -> Vec<Vec<Option<Pitch>>> {
-	let mut draw_scope = |params: &[CueParam]| -> Option<Pitch> {
+fn draw_pitches(program: &CueProgram, rng: &mut [u32; 4]) -> Vec<Vec<Option<f32>>> {
+	let mut draw_scope = |params: &[CueParam]| -> Option<f32> {
 		params.iter().find_map(|p| match *p {
-			CueParam::Pitch(cents) => Some(Pitch { cents, random: false }),
+			CueParam::Pitch(cents) => Some(cents),
 			CueParam::RandomPitch { center_cents, range_cents } => {
-				Some(Pitch { cents: draw(rng, center_cents, range_cents), random: true })
+				Some(draw(rng, center_cents, range_cents))
 			}
 			_ => None,
 		})
@@ -1373,5 +1382,45 @@ mod tests {
 			let got = draw(&mut players[p].clone(), 30.0, 255.0);
 			assert!((got - want).abs() < 0.01, "player {p}: {got}");
 		}
+	}
+
+	#[test]
+	fn steps() {
+		assert_eq!(step(48_000, 48_000, None), UNIT_STEP);
+		assert_eq!(step(48_000, 48_000, Some(0.0)), UNIT_STEP);
+		assert_eq!(step(44_100, 48_000, None), 3763);
+		// 48000 · 2^(135/1200) = 51,892.8 Hz, truncated before the division
+		assert_eq!(step(48_000, 48_000, Some(135.0)), (51_892 << 12) / 48_000);
+		assert_eq!(step(48_000, 48_000, Some(1200.0)), 8192);
+		assert_eq!(step(48_000, 48_000, Some(4800.0)), 8 * UNIT_STEP);
+	}
+
+	#[test]
+	fn resampled_lengths() {
+		assert_eq!(resampled_frames(1000, UNIT_STEP), 1000);
+		assert_eq!(resampled_frames(1000, 8192), 500);
+		// 4096 / 3763 = 1 frame short of 1000 · 4096 / 3763 = 1088.5
+		assert_eq!(resampled_frames(1000, 3763), 1087);
+	}
+
+	#[test]
+	fn interpolation() {
+		let pcm = [0.0, 1.0, 1.0, -1.0, 0.5, 0.25];
+		assert_eq!(sample(&pcm, 3, UNIT_STEP, 1, 0), (1.0, -1.0));
+		// Halfway between frames 0 and 1, then a quarter of the way from 1 to 2
+		assert_eq!(sample(&pcm, 3, 2048, 1, 0), (0.5, 0.0));
+		assert_eq!(sample(&pcm, 3, 5120, 1, 0), (0.875, -0.6875));
+	}
+
+	#[test]
+	fn a_resampling_voice_ends_with_its_last_pull() {
+		let grid = PassGrid::of(&cfg(), 40);
+		// 1060 frames at 1.5 could make 706, but the pull whose 8-frame lookahead reaches the last
+		// source frame is the block ending at 704, and the voice ends with it.
+		assert_eq!(resampled_frames(1060, 6144), 706);
+		assert_eq!(grid.voice_frames(0, 1060, 6144), 704);
+		// From 448 that pull is the block ending at 1120, past all 706.
+		assert_eq!(grid.voice_frames(448, 1060, 6144), 706);
+		assert_eq!(grid.voice_frames(0, 1060, UNIT_STEP), 1060);
 	}
 }
