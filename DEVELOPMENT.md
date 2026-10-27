@@ -8,3 +8,9 @@
 4. Push the commit and the tag: `git push origin master vX.Y.Z`.
 
 A project moves to it by changing its `tag` and running `cargo update -p cri`.
+
+## Accuracy
+
+The ADX and HCA decoders produce the same `f32` samples as CRI's own runtime, bit for bit, on the
+files they were checked with. Keep it that way: no `f32::mul_add`, and no reordering of
+floating-point operations.

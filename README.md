@@ -19,17 +19,11 @@ Every fallible function returns `cri::Error`, which says which format the input 
 
 `cli/` builds `cri`, a command-line tool over the crate: `cargo install --path cli`.
 
-| command   | what                                                                     |
-| --------- | ------------------------------------------------------------------------ |
-| `ls`      | the CRI files in a directory or among files, one line each               |
-| `info`    | what a file holds: cues, waveforms, archive entries, buses or streams    |
-| `utf`     | an ACB's or ACF's `@UTF` tables, their schemas and rows                  |
-| `extract` | audio and video out of a file, decoded to WAV or as stored               |
+| command   | what                                                                  |
+| --------- | --------------------------------------------------------------------- |
+| `ls`      | the CRI files in a directory or among files, one line each            |
+| `info`    | what a file holds: cues, waveforms, archive entries, buses or streams |
+| `utf`     | an ACB's or ACF's `@UTF` tables, their schemas and rows               |
+| `extract` | audio and video out of a file, decoded to WAV or as stored            |
 
 Encrypted files need the keycode, given with `--key` or the `CRI_KEY` environment variable.
-
-## Accuracy
-
-The ADX and HCA decoders produce the same `f32` samples as CRI's own runtime, bit for bit, on the
-files they were checked with. Keep it that way: no `f32::mul_add`, and no reordering of
-floating-point operations.
