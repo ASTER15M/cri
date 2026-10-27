@@ -3,7 +3,7 @@
 Every release is tagged `v<version>`. Versions follow semver; before 1.0, a minor bump (0.1 → 0.2)
 is a breaking change and a patch bump (0.1.0 → 0.1.1) is not.
 
-## Unreleased
+## 0.2.1
 
 - `asr::AsrMixer::add_cue` plays a cue of the caller's own: a `CueProgram` built in code, its layers
   playing given samples rather than an ACB's waveforms. It returns the sheet index to play it by.
