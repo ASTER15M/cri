@@ -3,7 +3,7 @@
 Every release is tagged `v<version>`. Versions follow semver; before 1.0, a minor bump (0.1 → 0.2)
 is a breaking change and a patch bump (0.1.0 → 0.1.1) is not.
 
-## Unreleased
+## 0.4.0
 
 - **Breaking:** `acb::program::CueSheet`, `asr::AsrMixer` and `asr::AsrStream` own what they read
   and have no lifetime. `CueSheet::open` takes the `Acb` itself; `AsrMixer::new` takes
