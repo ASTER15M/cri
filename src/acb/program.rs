@@ -249,8 +249,8 @@ impl CueProgram {
 }
 
 // An ACB with its tables parsed once
-pub struct CueSheet<'a> {
-	acb: &'a Acb,
+pub struct CueSheet {
+	acb: Acb,
 	cue: Utf,
 	sequence: Utf,
 	track: Utf,
@@ -267,12 +267,12 @@ pub struct CueSheet<'a> {
 	strings: Vec<String>,
 	names: HashMap<String, usize>,
 	cue_names: Vec<String>,
-	internal: Option<(Afs2, &'a [u8])>,
+	internal: Option<Afs2>, // over the ACB's own `AwbFile`
 	external: Option<(Afs2, Vec<u8>)>,
 }
 
-impl<'a> CueSheet<'a> {
-	pub fn open(acb: &'a Acb) -> Result<Self> {
+impl CueSheet {
+	pub fn open(acb: Acb) -> Result<Self> {
 		let cue = acb.table_or_empty("CueTable");
 		let cue_name = acb.table_or_empty("CueNameTable");
 		let mut names = HashMap::new();
@@ -291,9 +291,8 @@ impl<'a> CueSheet<'a> {
 		let strings = (0..string_table.rows.len())
 			.map(|i| string_table.get_str(i, "StringValue").unwrap_or_default().to_string())
 			.collect();
-		let internal = acb.internal_awb().transpose()?;
+		let internal = acb.internal_awb().transpose()?.map(|(afs2, _)| afs2);
 		Ok(Self {
-			acb,
 			cue,
 			sequence: acb.table_or_empty("SequenceTable"),
 			track: acb.table_or_empty("TrackTable"),
@@ -312,6 +311,7 @@ impl<'a> CueSheet<'a> {
 			cue_names,
 			internal,
 			external: None,
+			acb,
 		})
 	}
 
@@ -322,7 +322,7 @@ impl<'a> CueSheet<'a> {
 	}
 
 	pub fn acb(&self) -> &Acb {
-		self.acb
+		&self.acb
 	}
 	pub fn cue_count(&self) -> usize {
 		self.cue.rows.len()
@@ -339,7 +339,7 @@ impl<'a> CueSheet<'a> {
 
 	fn archive(&self, source: AwbSource) -> Option<(&Afs2, &[u8])> {
 		match source {
-			AwbSource::Internal => self.internal.as_ref().map(|(a, b)| (a, *b)),
+			AwbSource::Internal => self.internal.as_ref().zip(self.acb.root.get_bytes(0, "AwbFile")),
 			AwbSource::External => self.external.as_ref().map(|(a, b)| (a, b.as_slice())),
 		}
 	}

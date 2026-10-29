@@ -125,7 +125,7 @@ pub fn load_awb(acb: &Path, awb: Option<PathBuf>) -> Result<Option<Vec<u8>>> {
 	}
 }
 
-fn open_sheet<'a>(acb: &'a Acb, awb: Option<Vec<u8>>) -> Result<CueSheet<'a>> {
+fn open_sheet(acb: Acb, awb: Option<Vec<u8>>) -> Result<CueSheet> {
 	let sheet = CueSheet::open(acb)?;
 	Ok(match awb {
 		Some(b) => sheet.with_external_awb(b)?,
@@ -680,7 +680,7 @@ fn acb_info(path: &Path, bytes: Vec<u8>, o: Info) -> Result<()> {
 			wave_lines(&acb, streaming.as_deref(), only.as_ref())
 		})
 		.transpose()?;
-	let sheet = open_sheet(&acb, streaming)?;
+	let sheet = open_sheet(acb, streaming)?;
 	let indices: Vec<usize> = cues.iter().map(|(i, _)| *i).collect();
 	let show_cues = all || o.cues || full;
 	if show_cues {
@@ -783,12 +783,12 @@ fn cue_programs(sheet: &CueSheet, indices: &[usize], graphs: bool) {
 	}
 }
 
-struct Scope<'s, 'a> {
-	sheet: &'s CueSheet<'a>,
+struct Scope<'s> {
+	sheet: &'s CueSheet,
 	graphs: bool,
 }
 
-impl Scope<'_, '_> {
+impl Scope<'_> {
 	fn params(&self, pad: &str, params: &[CueParam], local: &[usize], global: &[String]) {
 		for p in params {
 			println!("{pad}{}", param(p));

@@ -443,23 +443,27 @@ fn echo_tail(rate: u32, delay_ms: f32, feedback: f32) -> u32 {
 	if tail.is_nan() { 0x8000_0000 } else { tail as i32 as u32 }
 }
 
+// The DSP setting `name`'s position in the ACF
+fn dsp_setting(acf: &Acf, name: &str) -> Result<usize> {
+	(acf.dsp_settings.iter().position(|s| s.name == name))
+		.ok_or_else(|| Error::unrenderable(format!("the ACF has no DSP setting {name}")))
+}
+
 // Holds the decoded waveforms: most plays repeat a cue.
-pub struct AsrMixer<'a> {
-	sheets: Vec<&'a CueSheet<'a>>,
-	acf: &'a Acf,
-	setting: &'a DspSetting,
+pub struct AsrMixer {
+	sheets: Vec<Arc<CueSheet>>,
+	acf: Arc<Acf>,
+	setting: usize, // in `acf.dsp_settings`
 	cfg: AsrConfig,
 	waveforms: HashMap<(usize, usize), Arc<Waveform>>,
 	programs: HashMap<(usize, Cue), Arc<CueProgram>>,
 	own_cues: usize, // given by `add_cue`, each a sheet after the ACBs'
 }
 
-impl<'a> AsrMixer<'a> {
+impl AsrMixer {
 	// Through the ACF's default DSP setting
-	pub fn new(sheets: Vec<&'a CueSheet<'a>>, acf: &'a Acf, cfg: AsrConfig) -> Result<Self> {
-		let setting = (acf.dsp_setting(&acf.default_dsp_setting)).ok_or_else(|| {
-			Error::unrenderable(format!("the ACF has no DSP setting {}", acf.default_dsp_setting))
-		})?;
+	pub fn new(sheets: Vec<Arc<CueSheet>>, acf: Arc<Acf>, cfg: AsrConfig) -> Result<Self> {
+		let setting = dsp_setting(&acf, &acf.default_dsp_setting)?;
 		let (waveforms, programs) = (HashMap::new(), HashMap::new());
 		Ok(Self { sheets, acf, setting, cfg, waveforms, programs, own_cues: 0 })
 	}
@@ -495,8 +499,7 @@ impl<'a> AsrMixer<'a> {
 	}
 
 	pub fn with_dsp_setting(mut self, name: &str) -> Result<Self> {
-		self.setting = (self.acf.dsp_setting(name))
-			.ok_or_else(|| Error::unrenderable(format!("the ACF has no DSP setting {name}")))?;
+		self.setting = dsp_setting(&self.acf, name)?;
 		Ok(self)
 	}
 
@@ -507,8 +510,13 @@ impl<'a> AsrMixer<'a> {
 	// Replays `commands`, sorted by tick, over `ticks` ticks.
 	pub fn render(&mut self, commands: &[Command], ticks: u64) -> Result<Mix> {
 		let caches = (std::mem::take(&mut self.waveforms), std::mem::take(&mut self.programs));
-		let mixer =
-			AsrMixer { waveforms: caches.0, programs: caches.1, sheets: self.sheets.clone(), ..*self };
+		let mixer = AsrMixer {
+			sheets: self.sheets.clone(),
+			acf: self.acf.clone(),
+			waveforms: caches.0,
+			programs: caches.1,
+			..*self
+		};
 		let mut stream = mixer.stream()?;
 		let pushed = commands.iter().try_for_each(|c| stream.push(c));
 		let frames = ticks * self.cfg.frames_per_tick();
@@ -530,8 +538,8 @@ impl<'a> AsrMixer<'a> {
 	}
 
 	// The mixer as a stream, from tick 0
-	pub fn stream(self) -> Result<AsrStream<'a>> {
-		let graph = BusGraph::of(self.setting, self.cfg.rate)?;
+	pub fn stream(self) -> Result<AsrStream> {
+		let graph = BusGraph::of(&self.acf.dsp_settings[self.setting], self.cfg.rate)?;
 		let mut global = seeded(self.cfg.seed);
 		let slots = (0..self.cfg.players)
 			.map(|_| {
@@ -806,8 +814,8 @@ struct Slot {
 // out as they are asked for. No command reaches back before its own tick's pass, so a voice is laid
 // out when its play arrives, and a later stop only shortens it or drops it before it starts.
 // `AsrMixer::render` is this with every command pushed first.
-pub struct AsrStream<'a> {
-	mixer: AsrMixer<'a>,
+pub struct AsrStream {
+	mixer: AsrMixer,
 	grid: PassGrid,
 	graph: BusGraph,
 	slots: Vec<Slot>,
@@ -830,7 +838,7 @@ pub struct AsrStream<'a> {
 	approximated: Approximated,
 }
 
-impl<'a> AsrStream<'a> {
+impl AsrStream {
 	pub fn config(&self) -> AsrConfig {
 		self.mixer.cfg
 	}
@@ -858,7 +866,7 @@ impl<'a> AsrStream<'a> {
 		&self.approximated
 	}
 
-	pub fn into_mixer(self) -> AsrMixer<'a> {
+	pub fn into_mixer(self) -> AsrMixer {
 		self.mixer
 	}
 
@@ -961,7 +969,7 @@ impl<'a> AsrStream<'a> {
 		}
 		self.layers.push(first..self.voices.len());
 		self.played.extend(playback.play.program.categories());
-		let acf = self.mixer.acf;
+		let acf = &self.mixer.acf;
 		let index_played =
 			|i: usize| acf.categories.get(i).is_some_and(|c| self.played.contains(&c.id));
 		for r in &acf.reacts {
@@ -1563,7 +1571,7 @@ mod tests {
 	#[test]
 	fn a_stream_can_move_to_another_thread() {
 		fn send<T: Send>() {}
-		send::<AsrStream<'static>>();
+		send::<AsrStream>();
 	}
 
 	#[test]
